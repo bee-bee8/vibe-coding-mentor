@@ -1,0 +1,19 @@
+[package]
+name = "codex-mentor"
+version = "0.1.0"
+description = "A local-first project watcher for Codex Mentor"
+authors = ["Codex Mentor"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+notify = "6.1"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
