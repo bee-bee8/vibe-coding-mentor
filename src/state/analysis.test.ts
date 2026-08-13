@@ -26,6 +26,7 @@ const analysis: ChangeAnalysis = {
     projectPath: 'C:/project',
     source: 'local-snapshot',
     completion: 'explicit',
+    completionGeneration: 1,
     changedFileCount: 1,
     supplied: {
       task: null,

@@ -27,6 +27,7 @@ export interface AnalysisMetadata {
   projectPath: string;
   source: string;
   completion: string;
+  completionGeneration: number;
   changedFileCount: number;
   supplied: CompletionMetadata;
 }

@@ -70,9 +70,21 @@ struct Runtime {
     watcher: Option<WatcherHandle>,
 }
 
+#[derive(Clone)]
 pub struct AppState {
     runtime: Arc<Mutex<Runtime>>,
     publication: Arc<Mutex<()>>,
+}
+
+/// Frozen context captured under the watcher runtime lock for one Ask Mentor
+/// request.  The generation and canonical analysis are checked again before a
+/// response is published so a project switch or newly completed change cannot
+/// leak an answer into the wrong dashboard state.
+#[derive(Clone)]
+pub(crate) struct MentorContext {
+    pub project_path: String,
+    pub generation: u64,
+    pub analysis: analysis::ChangeAnalysis,
 }
 
 impl Default for AppState {
@@ -106,6 +118,60 @@ impl WatcherHandle {
 
 fn lock_runtime(state: &AppState) -> MutexGuard<'_, Runtime> {
     state.runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn capture_mentor_context(state: &AppState) -> Result<MentorContext, String> {
+    let runtime = lock_runtime(state);
+    let project_path = runtime
+        .state
+        .project_path
+        .clone()
+        .ok_or_else(|| "Ask Mentor requires a watched project".to_string())?;
+    if runtime.analysis.status != analysis::AnalysisStatus::Available {
+        return Err("Ask Mentor requires a completed current change analysis".to_string());
+    }
+    let current = runtime
+        .analysis
+        .analysis
+        .clone()
+        .ok_or_else(|| "Ask Mentor has no current change analysis".to_string())?;
+    if current.metadata.project_path != project_path {
+        return Err("Ask Mentor analysis does not belong to the watched project".to_string());
+    }
+    Ok(MentorContext {
+        project_path,
+        generation: runtime.generation,
+        analysis: current,
+    })
+}
+
+/// Run a Mentor publication only while the watcher publication gate is held.
+///
+/// The context check and the callback that mutates/emits Mentor state are one
+/// critical section with respect to `complete_change`, `start_watching`, and
+/// `stop_watching`, all of which claim the same gate before advancing the
+/// watcher generation.  The callback must not call back into this module while
+/// it runs; it may update the independent Mentor runtime and emit its event.
+pub(crate) fn publish_mentor_if_current<T, Publish>(
+    state: &AppState,
+    context: &MentorContext,
+    publish: Publish,
+) -> Option<T>
+where
+    Publish: FnOnce() -> T,
+{
+    let _publication = state
+        .publication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = {
+        let runtime = lock_runtime(state);
+        runtime.generation == context.generation
+            && runtime.state.project_path.as_deref() == Some(context.project_path.as_str())
+            && runtime.analysis.status == analysis::AnalysisStatus::Available
+            && runtime.analysis.analysis.as_ref() == Some(&context.analysis)
+    };
+    current.then(publish)
 }
 
 fn claim_start_generation(
@@ -788,11 +854,12 @@ pub fn complete_change(
     };
     let root = Path::new(&project_path);
     let after = diff::capture_snapshot(root)?;
-    let Some(completed) = analysis::build_analysis(
+    let Some(completed) = analysis::build_analysis_with_generation(
         root,
         &before,
         &after,
         metadata.unwrap_or_default(),
+        generation.wrapping_add(1),
     )? else {
         // The baseline is unchanged, so no record and no event are created.
         return Ok(None);
@@ -1239,6 +1306,77 @@ mod tests {
         assert!(!published);
         assert!(events.is_empty());
         assert_eq!(runtime.lock().unwrap().generation, current_generation);
+    }
+
+    #[test]
+    fn mentor_publication_gate_blocks_a_generation_claim_until_after_emit() {
+        let project = TempProject::new();
+        let file = project.0.join("main.ts");
+        fs::write(&file, "before\n").unwrap();
+        let before = diff::capture_snapshot(&project.0).unwrap();
+        fs::write(&file, "after\n").unwrap();
+        let after = diff::capture_snapshot(&project.0).unwrap();
+        let completed = analysis::build_analysis_with_generation(
+            &project.0,
+            &before,
+            &after,
+            analysis::CompletionMetadata::default(),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let project_path = project.0.to_string_lossy().into_owned();
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 1,
+            state: WatcherState {
+                project_path: Some(project_path.clone()),
+                status: WatcherStatus::Watching,
+                records: Vec::new(),
+                diff: diff::state_for_baseline(&project.0, &after),
+                error: None,
+            },
+            baseline: Some(after),
+            analysis: analysis::AnalysisState {
+                status: analysis::AnalysisStatus::Available,
+                analysis: Some(completed.clone()),
+                error: None,
+            },
+            watcher: None,
+        }));
+        let state = AppState {
+            runtime,
+            publication: Arc::new(Mutex::new(())),
+        };
+        let context = MentorContext {
+            project_path,
+            generation: 1,
+            analysis: completed,
+        };
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let publish_state = state.clone();
+        let publish_context = context.clone();
+        let publisher = thread::spawn(move || {
+            publish_mentor_if_current(&publish_state, &publish_context, || {
+                entered_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                "published"
+            })
+        });
+
+        entered_receiver.recv().unwrap();
+        let (claimed_sender, claimed_receiver) = mpsc::channel();
+        let claim_state = state.clone();
+        let claimer = thread::spawn(move || {
+            let (_, generation) = claim_start_generation(&claim_state.runtime, &claim_state.publication);
+            claimed_sender.send(generation).unwrap();
+        });
+        assert!(claimed_receiver.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_sender.send(()).unwrap();
+        assert_eq!(publisher.join().unwrap(), Some("published"));
+        assert_eq!(claimed_receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        claimer.join().unwrap();
     }
 
     #[test]

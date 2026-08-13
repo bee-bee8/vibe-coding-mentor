@@ -43,6 +43,10 @@ pub struct AnalysisMetadata {
     pub project_path: String,
     pub source: String,
     pub completion: String,
+    /// Monotonic watcher generation at the completed-change boundary.  This
+    /// remains distinct even when two sequential changes have identical
+    /// snapshots and metadata.
+    pub completion_generation: u64,
     pub changed_file_count: usize,
     pub supplied: CompletionMetadata,
 }
@@ -275,6 +279,20 @@ pub fn build_analysis(
     after: &FileSnapshot,
     supplied: CompletionMetadata,
 ) -> Result<Option<ChangeAnalysis>, String> {
+    build_analysis_with_generation(project_path, before, after, supplied, 0)
+}
+
+/// Build a completed analysis with the watcher generation that owns its
+/// frozen boundary.  The zero-generation wrapper above keeps direct
+/// deterministic unit fixtures concise; real completion uses this function's
+/// boundary identity.
+pub fn build_analysis_with_generation(
+    project_path: &Path,
+    before: &FileSnapshot,
+    after: &FileSnapshot,
+    supplied: CompletionMetadata,
+    completion_generation: u64,
+) -> Result<Option<ChangeAnalysis>, String> {
     let Some(context) = build_context(project_path, before, after, supplied.clone())? else {
         return Ok(None);
     };
@@ -285,6 +303,7 @@ pub fn build_analysis(
             project_path: context.project_path,
             source: "local-snapshot".to_string(),
             completion: "explicit".to_string(),
+            completion_generation,
             changed_file_count: context.files.len(),
             supplied,
         },
@@ -392,6 +411,32 @@ mod tests {
         assert_eq!(first.record.changed_components, vec!["src/app.ts"]);
         assert_eq!(first.record.impact, "Unknown: runtime and product impact was not supplied.");
         assert!(first.record.programming_concepts.is_empty());
+    }
+
+    #[test]
+    fn completion_generation_distinguishes_identical_sequential_boundaries() {
+        let before = snapshot(&[("src/app.ts", SnapshotEntry::Content(b"old\n".to_vec()))]);
+        let after = snapshot(&[("src/app.ts", SnapshotEntry::Content(b"new\n".to_vec()))]);
+        let first = build_analysis_with_generation(
+            Path::new("C:/project"),
+            &before,
+            &after,
+            CompletionMetadata::default(),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let second = build_analysis_with_generation(
+            Path::new("C:/project"),
+            &before,
+            &after,
+            CompletionMetadata::default(),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(first.metadata.completion_generation, second.metadata.completion_generation);
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import {
   completeChange,
@@ -29,8 +29,24 @@ import {
   createAnalysisError,
   createInitialAnalysisState,
 } from './state/analysis';
+import {
+  applyMentorInitialInvokeResult,
+  applyMentorInvokeResult,
+  applyMentorState,
+  createInitialMentorState,
+  createMentorError,
+  resetMentorState,
+} from './state/mentor';
+import {
+  askMentor,
+  cancelMentor,
+  getMentorState,
+  resetMentor,
+  subscribeToMentor,
+} from './lib/mentorClient';
 import type { AnalysisState, ChangeAnalysis } from './types/analysis';
 import type { DiffFileRecord, DiffState, FilePreview } from './types/diff';
+import type { MentorState } from './types/mentor';
 import type { WatcherState } from './types/watcher';
 
 function statusLabel(status: WatcherState['status']): string {
@@ -241,6 +257,85 @@ function EngineerExplanation({
   );
 }
 
+type AskMentorProps = {
+  analysis: ChangeAnalysis;
+  state: MentorState;
+  question: string;
+  selectedFrozenPath: string | null;
+  onQuestionChange: (question: string) => void;
+  onAsk: () => void;
+  onCancel: () => void;
+};
+
+function AskMentorPanel({
+  analysis,
+  state,
+  question,
+  selectedFrozenPath,
+  onQuestionChange,
+  onAsk,
+  onCancel,
+}: AskMentorProps) {
+  const isLoading = state.status === 'loading';
+  return (
+    <section className="panel mentor-panel" aria-label="Ask Mentor">
+      <div className="panel-heading">
+        <div>
+          <span className="section-label">Current-change Q&amp;A</span>
+          <h2>Ask Mentor</h2>
+        </div>
+        <span className="hint">Read-only, scoped to this frozen analysis</span>
+      </div>
+      <div className="mentor-content">
+        <p className="mentor-boundary">
+          Ask about the {analysis.metadata.changedFileCount === 1 ? 'changed file' : 'changed files'}
+          {' '}shown in the current Change Record. Mentor will say when the supplied evidence is not enough.
+        </p>
+        <p className="mentor-selection">
+          <span>Selected frozen file:</span>{' '}
+          {selectedFrozenPath ? <code>{selectedFrozenPath}</code> : <em>None (optional)</em>}
+        </p>
+        <label className="mentor-question-label" htmlFor="mentor-question">
+          Your question
+        </label>
+        <textarea
+          id="mentor-question"
+          value={question}
+          onChange={(event) => onQuestionChange(event.target.value)}
+          placeholder="What does this changed function do?"
+          rows={4}
+          disabled={isLoading}
+        />
+        <div className="mentor-actions">
+          <button
+            type="button"
+            onClick={onAsk}
+            disabled={isLoading || !question.trim()}
+          >
+            {isLoading ? 'Thinking...' : 'Ask Mentor'}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onCancel}
+            disabled={!isLoading}
+          >
+            Cancel
+          </button>
+        </div>
+        {isLoading && <p className="mentor-status">Waiting for the read-only Codex response...</p>}
+        {state.error && <p className="error-message mentor-error">{state.error}</p>}
+        {state.answer && state.status === 'available' && (
+          <article className="mentor-answer">
+            <h3>Answer</h3>
+            <p>{state.answer.answer}</p>
+          </article>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<WatcherState>(createInitialWatcherState);
   const [isSelecting, setIsSelecting] = useState(false);
@@ -252,6 +347,12 @@ export default function App() {
     createInitialAnalysisState,
   );
   const [isCompleting, setIsCompleting] = useState(false);
+  const [mentorState, setMentorState] = useState<MentorState>(
+    createInitialMentorState,
+  );
+  const [mentorQuestion, setMentorQuestion] = useState('');
+  const mentorRequestToken = useRef(0);
+  const mentorEventVersion = useRef(0);
 
   useEffect(() => {
     let mounted = true;
@@ -272,6 +373,57 @@ export default function App() {
       } catch (error) {
         if (mounted) {
           setState((current) => createWatcherError(current, errorMessage(error)));
+        }
+      }
+    };
+
+    void connect();
+    return () => {
+      mounted = false;
+      removeListener?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    let removeListener: (() => void) | undefined;
+    let eventVersionBeforeInvoke: number | undefined;
+
+    const connect = async () => {
+      try {
+        const nextRemoveListener = await subscribeToMentor(
+          (nextState) => {
+            mentorEventVersion.current += 1;
+            if (mounted) {
+              setMentorState((current) => applyMentorState(current, nextState));
+            }
+          },
+        );
+        if (!mounted) {
+          nextRemoveListener();
+          return;
+        }
+        removeListener = nextRemoveListener;
+        const invokeEventVersion = mentorEventVersion.current;
+        eventVersionBeforeInvoke = invokeEventVersion;
+        const currentState = await getMentorState();
+        if (mounted) {
+          setMentorState((current) =>
+            applyMentorInitialInvokeResult(
+              current,
+              currentState,
+              invokeEventVersion,
+              mentorEventVersion.current,
+            ),
+          );
+        }
+      } catch (error) {
+        if (
+          mounted &&
+          (eventVersionBeforeInvoke === undefined ||
+            eventVersionBeforeInvoke === mentorEventVersion.current)
+        ) {
+          setMentorState((current) => createMentorError(current, errorMessage(error)));
         }
       }
     };
@@ -314,6 +466,17 @@ export default function App() {
       removeListener?.();
     };
   }, []);
+
+  const analysisKey = analysisState.analysis
+    ? `${analysisState.analysis.metadata.projectPath}:${analysisState.analysis.metadata.completionGeneration}`
+    : null;
+
+  useEffect(() => {
+    mentorRequestToken.current += 1;
+    setMentorState(resetMentorState());
+    setMentorQuestion('');
+    void resetMentor().catch(() => undefined);
+  }, [analysisKey]);
 
   const selectedLiveRecord =
     selection?.source === 'completed'
@@ -381,8 +544,11 @@ export default function App() {
     try {
       const selected = await chooseProject();
       if (selected) {
+        mentorRequestToken.current += 1;
         setState(selected);
         setAnalysisState(createInitialAnalysisState());
+        setMentorState(resetMentorState());
+        setMentorQuestion('');
       }
     } catch (error) {
       setState((current) => createWatcherError(current, errorMessage(error)));
@@ -393,8 +559,11 @@ export default function App() {
 
   const clearProject = async () => {
     try {
+      mentorRequestToken.current += 1;
       setState(await stopWatching());
       setAnalysisState(createInitialAnalysisState());
+      setMentorState(resetMentorState());
+      setMentorQuestion('');
     } catch (error) {
       setState((current) => createWatcherError(current, errorMessage(error)));
     }
@@ -410,6 +579,36 @@ export default function App() {
       );
     } finally {
       setIsCompleting(false);
+    }
+  };
+
+  const submitMentorQuestion = async () => {
+    const requestToken = ++mentorRequestToken.current;
+    try {
+      const next = await askMentor(mentorQuestion, selectedFrozenPreview?.path ?? null);
+      setMentorState((current) => applyMentorInvokeResult(current, next));
+    } catch (error) {
+      setMentorState((current) => {
+        if (mentorRequestToken.current !== requestToken) {
+          return current;
+        }
+        return createMentorError(current, errorMessage(error));
+      });
+    }
+  };
+
+  const cancelMentorQuestion = async () => {
+    const requestToken = mentorRequestToken.current;
+    try {
+      const next = await cancelMentor();
+      setMentorState((current) => applyMentorInvokeResult(current, next));
+    } catch (error) {
+      setMentorState((current) => {
+        if (mentorRequestToken.current !== requestToken) {
+          return current;
+        }
+        return createMentorError(current, errorMessage(error));
+      });
     }
   };
 
@@ -479,6 +678,18 @@ export default function App() {
             analysis={analysisState.analysis}
             projectPath={state.projectPath}
             setSelection={setSelection}
+          />
+        )}
+
+        {analysisState.analysis && (
+          <AskMentorPanel
+            analysis={analysisState.analysis}
+            state={mentorState}
+            question={mentorQuestion}
+            selectedFrozenPath={selectedFrozenPreview?.path ?? null}
+            onQuestionChange={setMentorQuestion}
+            onAsk={() => void submitMentorQuestion()}
+            onCancel={() => void cancelMentorQuestion()}
           />
         )}
 

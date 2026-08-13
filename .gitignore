@@ -9,6 +9,8 @@
 /.vite/
 /coverage/
 *.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
 
 # Rust / Tauri build output
 /src-tauri/target/
