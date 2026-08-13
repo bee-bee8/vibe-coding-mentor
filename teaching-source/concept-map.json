@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "concepts": [
+    { "id": "functions", "source": "concepts/functions.md", "prerequisites": [] },
+    { "id": "api", "source": "concepts/api.md", "prerequisites": ["functions"] },
+    { "id": "async-await", "source": "concepts/async-await.md", "prerequisites": ["functions"] }
+  ]
+}

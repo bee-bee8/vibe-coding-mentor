@@ -26,7 +26,7 @@ h2 { margin-bottom: 0; color: #f8fafc; font-size: 1.12rem; }
 .status-watching .status-dot { background: #34d399; box-shadow: 0 0 0 4px #34d39922; }
 .status-error .status-dot { background: #fb7185; }
 
-.dashboard-grid { display: grid; grid-template-areas: "project stats" "files preview" "engineer engineer" "mentor mentor"; grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr); gap: 1rem; align-items: start; }
+.dashboard-grid { display: grid; grid-template-areas: "project stats" "files preview" "engineer engineer" "mentor mentor" "teaching teaching"; grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr); gap: 1rem; align-items: start; }
 .panel { min-width: 0; border: 1px solid #263650; border-radius: 16px; background: #111d33dd; box-shadow: 0 22px 50px #02061744; }
 .project-panel { grid-area: project; }
 .files-panel { grid-area: files; overflow: hidden; }
@@ -34,6 +34,7 @@ h2 { margin-bottom: 0; color: #f8fafc; font-size: 1.12rem; }
 .preview-panel { grid-area: preview; overflow: hidden; }
 .engineer-panel { grid-area: engineer; overflow: hidden; }
 .mentor-panel { grid-area: mentor; overflow: hidden; }
+.teaching-panel { grid-area: teaching; overflow: hidden; }
 .panel-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; padding: 1.25rem 1.4rem; border-bottom: 1px solid #263650; }
 .source-label, .preview-meta { color: #a5b4fc; font-size: 0.78rem; font-weight: 650; text-align: right; }
 .hint { color: #64748b; font-size: 0.78rem; text-align: right; }
@@ -56,6 +57,11 @@ h2 { margin-bottom: 0; color: #f8fafc; font-size: 1.12rem; }
 .mentor-answer { margin-top: 1rem; border: 1px solid #155e4b; border-radius: 11px; padding: 0.9rem 1rem; background: #052e2b66; }
 .mentor-answer h3 { margin: 0 0 0.45rem; color: #6ee7b7; font-size: 0.78rem; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
 .mentor-answer p { margin: 0; color: #d1fae5; font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap; }
+.teaching-content { padding: 1.15rem 1.4rem 1.4rem; }
+.teaching-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; }
+.teaching-answer { margin-top: 1rem; border: 1px solid #365486; border-radius: 11px; padding: 0.9rem 1rem; background: #17255488; }
+.teaching-answer h3 { margin: 0 0 0.45rem; color: #bfdbfe; font-size: 0.78rem; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
+.teaching-answer p { margin: 0; color: #dbeafe; font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap; }
 
 .engineer-panel-heading { align-items: center; }
 .engineer-mode-strip { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.45rem; }
@@ -122,7 +128,7 @@ button.engineer-code-reference:hover:not(:disabled) { border-color: #818cf8; bac
 .preview-warning p { margin: 0; }
 
 @media (max-width: 880px) {
-  .dashboard-grid { grid-template-areas: "project" "stats" "files" "preview" "engineer" "mentor"; grid-template-columns: minmax(0, 1fr); }
+  .dashboard-grid { grid-template-areas: "project" "stats" "files" "preview" "engineer" "mentor" "teaching"; grid-template-columns: minmax(0, 1fr); }
   .stats-grid { grid-template-columns: 1fr 1fr; }
 }
 

@@ -514,16 +514,13 @@ fn recv_response<T: ProtocolTransport>(
 
 fn run_protocol_without_cleanup<T: ProtocolTransport>(
     transport: &mut T,
-    question: &str,
+    prompt: &str,
     context: &MentorContext,
-    selected_path: Option<&str>,
     cancel: &Receiver<()>,
     timeout: Duration,
 ) -> (Result<String, ProtocolFailure>, Option<String>) {
     let mut created_thread: Option<String> = None;
     let result = (|| {
-        let prompt = build_prompt(question, &context.analysis, selected_path)
-            .map_err(ProtocolFailure::Error)?;
         let deadline = Instant::now() + timeout;
         transport
             .send(json!({
@@ -744,8 +741,10 @@ fn run_protocol<T: ProtocolTransport>(
     cancel: &Receiver<()>,
     timeout: Duration,
 ) -> Result<String, ProtocolFailure> {
+    let prompt = build_prompt(question, &context.analysis, selected_path)
+        .map_err(ProtocolFailure::Error)?;
     let (result, created_thread) =
-        run_protocol_without_cleanup(transport, question, context, selected_path, cancel, timeout);
+        run_protocol_without_cleanup(transport, &prompt, context, cancel, timeout);
     if let Some(thread) = created_thread.as_deref() {
         delete_thread(transport, thread);
     }
@@ -905,19 +904,27 @@ fn run_request(
     selected_path: Option<String>,
     cancel: Receiver<()>,
 ) -> Result<String, String> {
-    run_request_with_flag(
+    let prompt = build_prompt(&question, &context.analysis, selected_path.as_deref())?;
+    run_prompt_request_with_flag(
         context,
-        question,
-        selected_path,
+        prompt,
         cancel,
         Arc::new(AtomicBool::new(false)),
     )
 }
 
-fn run_request_with_flag(
+pub(crate) fn run_prompt_request_with_flag(
     context: MentorContext,
-    question: String,
-    selected_path: Option<String>,
+    prompt: String,
+    cancel: Receiver<()>,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<String, String> {
+    run_prompt_request_with_flag_inner(context, prompt, cancel, cancel_flag)
+}
+
+fn run_prompt_request_with_flag_inner(
+    context: MentorContext,
+    prompt: String,
     cancel: Receiver<()>,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<String, String> {
@@ -959,9 +966,8 @@ fn run_request_with_flag(
     // error into a timeout.
     let (result, created_thread) = run_protocol_without_cleanup(
         &mut transport,
-        &question,
+        &prompt,
         &context,
-        selected_path.as_deref(),
         &cancel,
         DEFAULT_TIMEOUT,
     );
@@ -1033,13 +1039,10 @@ pub fn ask_mentor(
     let mentor_runtime = mentor_state.runtime.clone();
     let watcher_snapshot = (*watcher_state).clone();
     thread::spawn(move || {
-        let result = run_request_with_flag(
-            context.clone(),
-            question.clone(),
-            selected_path.clone(),
-            cancel,
-            cancel_flag,
-        );
+        let prompt = build_prompt(&question, &context.analysis, selected_path.as_deref());
+        let result = prompt.and_then(|prompt| {
+            run_prompt_request_with_flag(context.clone(), prompt, cancel, cancel_flag)
+        });
         let next = match result {
             Ok(answer) => MentorStateSnapshot {
                 status: MentorStatus::Available,

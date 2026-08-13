@@ -48,6 +48,14 @@ import type { AnalysisState, ChangeAnalysis } from './types/analysis';
 import type { DiffFileRecord, DiffState, FilePreview } from './types/diff';
 import type { MentorState } from './types/mentor';
 import type { WatcherState } from './types/watcher';
+import type { TeachingLevel, TeachingState } from './types/teaching';
+import { getTeachingState, resetTeaching, subscribeToTeaching, teachChange } from './lib/teachingClient';
+import {
+  applyTeachingInitialInvokeResult,
+  applyTeachingInvokeResult,
+  applyTeachingState,
+  createInitialTeachingState,
+} from './state/teaching';
 
 function statusLabel(status: WatcherState['status']): string {
   if (status === 'error') return 'Error';
@@ -336,6 +344,27 @@ function AskMentorPanel({
   );
 }
 
+function TeachingPanel({
+  state,
+  onTeach,
+}: { state: TeachingState; onTeach: (level: TeachingLevel) => void }) {
+  const isLoading = state.status === 'loading';
+  return (
+    <section className="panel teaching-panel" aria-label="Teaching Mode">
+      <div className="panel-heading"><div><span className="section-label">Teaching Mode</span><h2>Explain this change</h2></div><span className="hint">Choose one level per explanation</span></div>
+      <div className="teaching-content">
+        <div className="teaching-actions" aria-label="Teaching levels">
+          <button type="button" onClick={() => onTeach('beginner')} disabled={isLoading}>Beginner</button>
+          <button type="button" className="secondary" onClick={() => onTeach('intermediate')} disabled={isLoading}>Intermediate</button>
+        </div>
+        {isLoading && <p className="mentor-status">Building the selected explanation from this frozen change...</p>}
+        {state.error && <p className="error-message mentor-error">{state.error}</p>}
+        {state.answer && state.status === 'available' && <article className="teaching-answer"><h3>{state.answer.level} explanation</h3><p>{state.answer.explanation}</p></article>}
+      </div>
+    </section>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<WatcherState>(createInitialWatcherState);
   const [isSelecting, setIsSelecting] = useState(false);
@@ -351,8 +380,11 @@ export default function App() {
     createInitialMentorState,
   );
   const [mentorQuestion, setMentorQuestion] = useState('');
+  const [teachingState, setTeachingState] = useState<TeachingState>(createInitialTeachingState);
   const mentorRequestToken = useRef(0);
   const mentorEventVersion = useRef(0);
+  const teachingRequestToken = useRef(0);
+  const teachingEventVersion = useRef(0);
 
   useEffect(() => {
     let mounted = true;
@@ -382,6 +414,47 @@ export default function App() {
       mounted = false;
       removeListener?.();
     };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    let removeListener: (() => void) | undefined;
+    let eventVersionBeforeInvoke: number | undefined;
+    const connect = async () => {
+      try {
+        const nextRemoveListener = await subscribeToTeaching((next) => {
+          teachingEventVersion.current += 1;
+          if (mounted) {
+            setTeachingState((current) => applyTeachingState(current, next));
+          }
+        });
+        if (!mounted) { nextRemoveListener(); return; }
+        removeListener = nextRemoveListener;
+        const invokeEventVersion = teachingEventVersion.current;
+        eventVersionBeforeInvoke = invokeEventVersion;
+        const current = await getTeachingState();
+        if (mounted) {
+          setTeachingState((state) =>
+            applyTeachingInitialInvokeResult(
+              state,
+              current,
+              invokeEventVersion,
+              teachingEventVersion.current,
+            ),
+          );
+        }
+      } catch (error) {
+        if (
+          mounted &&
+          (eventVersionBeforeInvoke === undefined ||
+            eventVersionBeforeInvoke === teachingEventVersion.current)
+        ) {
+          setTeachingState((current) => ({ ...current, status: 'error', error: errorMessage(error) }));
+        }
+      }
+    };
+    void connect();
+    return () => { mounted = false; removeListener?.(); };
   }, []);
 
   useEffect(() => {
@@ -473,9 +546,12 @@ export default function App() {
 
   useEffect(() => {
     mentorRequestToken.current += 1;
+    teachingRequestToken.current += 1;
     setMentorState(resetMentorState());
+    setTeachingState(createInitialTeachingState());
     setMentorQuestion('');
     void resetMentor().catch(() => undefined);
+    void resetTeaching().catch(() => undefined);
   }, [analysisKey]);
 
   const selectedLiveRecord =
@@ -545,9 +621,11 @@ export default function App() {
       const selected = await chooseProject();
       if (selected) {
         mentorRequestToken.current += 1;
+        teachingRequestToken.current += 1;
         setState(selected);
         setAnalysisState(createInitialAnalysisState());
         setMentorState(resetMentorState());
+        setTeachingState(createInitialTeachingState());
         setMentorQuestion('');
       }
     } catch (error) {
@@ -560,9 +638,11 @@ export default function App() {
   const clearProject = async () => {
     try {
       mentorRequestToken.current += 1;
+      teachingRequestToken.current += 1;
       setState(await stopWatching());
       setAnalysisState(createInitialAnalysisState());
       setMentorState(resetMentorState());
+      setTeachingState(createInitialTeachingState());
       setMentorQuestion('');
     } catch (error) {
       setState((current) => createWatcherError(current, errorMessage(error)));
@@ -608,6 +688,22 @@ export default function App() {
           return current;
         }
         return createMentorError(current, errorMessage(error));
+      });
+    }
+  };
+
+  const explainChange = async (level: TeachingLevel) => {
+    const requestToken = ++teachingRequestToken.current;
+    setTeachingState({ status: 'loading', answer: null, error: null });
+    try {
+      const next = await teachChange(level, selectedFrozenPreview?.path ?? null);
+      setTeachingState((current) => applyTeachingInvokeResult(current, next));
+    } catch (error) {
+      setTeachingState((current) => {
+        if (teachingRequestToken.current !== requestToken) {
+          return current;
+        }
+        return { ...current, status: 'error', error: errorMessage(error) };
       });
     }
   };
@@ -692,6 +788,8 @@ export default function App() {
             onCancel={() => void cancelMentorQuestion()}
           />
         )}
+
+        {analysisState.analysis && <TeachingPanel state={teachingState} onTeach={(level) => void explainChange(level)} />}
 
         <section className="panel files-panel" aria-label="Changed files">
           <div className="panel-heading">
