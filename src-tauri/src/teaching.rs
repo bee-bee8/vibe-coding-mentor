@@ -301,9 +301,14 @@ pub fn reset_teaching(app: AppHandle, state: State<'_, TeachingAppState>) -> Tea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::{AnalysisMetadata, ChangeAnalysis, ChangeRecord, ScopedFileContext};
-    use crate::diff::ContentStatus;
+    use crate::analysis::{
+        build_analysis, AnalysisMetadata, ChangeAnalysis, ChangeRecord, CompletionMetadata,
+        ScopedFileContext,
+    };
+    use crate::diff::{ContentStatus, FileSnapshot, SnapshotEntry};
     use crate::watcher::FileChangeStatus;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn context() -> MentorContext {
         MentorContext {
@@ -377,5 +382,37 @@ mod tests {
         assert!(prompt.contains("\"timesEncountered\":2"));
         assert!(prompt.contains("Proceed step by step"));
         assert!(!prompt.contains("Focus on architecture, data flow, abstraction"));
+    }
+
+    #[test]
+    fn real_build_analysis_concepts_reach_the_teaching_prompt() {
+        let before = FileSnapshot {
+            files: BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                SnapshotEntry::Content(b"old\n".to_vec()),
+            )]),
+        };
+        let after = FileSnapshot {
+            files: BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                SnapshotEntry::Content(b"pub fn serve() {}\n".to_vec()),
+            )]),
+        };
+        let analysis = build_analysis(
+            Path::new("C:/project"),
+            &before,
+            &after,
+            CompletionMetadata::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(analysis.record.programming_concepts, vec!["functions"]);
+        let context = MentorContext {
+            project_path: "C:/project".to_string(),
+            generation: 1,
+            analysis,
+        };
+        let prompt = build_teaching_prompt(&TeachingLevel::Beginner, &context, None).unwrap();
+        assert!(prompt.contains("\"programmingConcepts\":[\"functions\"]"));
     }
 }

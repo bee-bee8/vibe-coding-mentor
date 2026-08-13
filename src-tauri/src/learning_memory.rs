@@ -862,6 +862,43 @@ mod tests {
     }
 
     #[test]
+    fn real_build_analysis_concepts_reach_learning_memory_normalization_and_storage() {
+        let before = crate::diff::FileSnapshot {
+            files: std::collections::BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                crate::diff::SnapshotEntry::Content(b"old\n".to_vec()),
+            )]),
+        };
+        let after = crate::diff::FileSnapshot {
+            files: std::collections::BTreeMap::from([(
+                "src/lib.rs".to_string(),
+                crate::diff::SnapshotEntry::Content(b"pub fn serve() {}\n".to_vec()),
+            )]),
+        };
+        let analysis = crate::analysis::build_analysis(
+            Path::new("C:/project"),
+            &before,
+            &after,
+            crate::analysis::CompletionMetadata::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let concepts = normalize_concepts(&analysis.record.programming_concepts);
+        assert_eq!(concepts, vec!["functions"]);
+
+        let path = test_database_path();
+        let records = record_concepts_at_path(
+            &path,
+            &concepts,
+            "C:/project",
+            "2026-08-14T01:02:03.000Z",
+        )
+        .unwrap();
+        assert_eq!(records[0].concept, "functions");
+        remove_database(&path);
+    }
+
+    #[test]
     fn reverse_generation_reservation_keeps_newer_scope() {
         let state = LearningMemoryAppState::default();
         let newer_concepts = vec!["new concept".to_string()];
