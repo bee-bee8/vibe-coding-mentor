@@ -203,8 +203,8 @@ function EngineerExplanation({
         </div>
         <div className="engineer-mode-strip" aria-label="Explanation modes">
           <span className="engineer-mode engineer-mode-active">Engineer</span>
-          <span className="engineer-mode engineer-mode-inert">Beginner (future)</span>
-          <span className="engineer-mode engineer-mode-inert">Intermediate (future)</span>
+          <span className="engineer-mode engineer-mode-inert">Beginner</span>
+          <span className="engineer-mode engineer-mode-inert">Intermediate</span>
         </div>
       </div>
 
