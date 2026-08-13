@@ -3,12 +3,14 @@ import type {
   WatcherState,
   WatcherStatus,
 } from '../types/watcher';
+import { createInitialDiffState, resetDiffState } from './diff';
 
 export function createInitialWatcherState(): WatcherState {
   return {
     projectPath: null,
     status: 'idle',
     records: [],
+    diff: createInitialDiffState(),
     error: null,
   };
 }
@@ -57,6 +59,7 @@ export function resetWatcherState(
     projectPath,
     status,
     records: [],
+    diff: resetDiffState(projectPath),
     error: null,
   };
 }

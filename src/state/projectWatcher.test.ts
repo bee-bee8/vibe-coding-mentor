@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { createInitialDiffState } from './diff';
 import {
   applyWatcherChange,
   createInitialWatcherState,
@@ -14,6 +15,16 @@ describe('project watcher state', () => {
       projectPath: null,
       status: 'idle',
       records: [],
+      diff: {
+        projectPath: null,
+        source: 'none',
+        fallback: false,
+        files: [],
+        totalLinesAdded: 0,
+        totalLinesDeleted: 0,
+        unknownLineCountFiles: 0,
+        error: null,
+      },
       error: null,
     });
   });
@@ -23,6 +34,7 @@ describe('project watcher state', () => {
       projectPath: 'C:/old-project',
       status: 'watching' as const,
       records: [{ path: 'old.ts', status: 'modified' as const }],
+      diff: createInitialDiffState(),
       error: null,
     };
 
@@ -30,6 +42,16 @@ describe('project watcher state', () => {
       projectPath: 'C:/new-project',
       status: 'watching',
       records: [],
+      diff: {
+        projectPath: 'C:/new-project',
+        source: 'snapshot',
+        fallback: true,
+        files: [],
+        totalLinesAdded: 0,
+        totalLinesDeleted: 0,
+        unknownLineCountFiles: 0,
+        error: null,
+      },
       error: null,
     });
     expect(resetWatcherState(null)).toEqual(createInitialWatcherState());

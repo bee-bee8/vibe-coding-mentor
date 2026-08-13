@@ -1,3 +1,5 @@
+import type { DiffState } from './diff';
+
 export type WatcherStatus = 'idle' | 'watching' | 'error';
 
 export type FileChangeStatus = 'added' | 'modified' | 'deleted';
@@ -11,6 +13,7 @@ export interface WatcherState {
   projectPath: string | null;
   status: WatcherStatus;
   records: FileChangeRecord[];
+  diff: DiffState;
   error: string | null;
 }
 

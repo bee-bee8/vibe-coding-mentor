@@ -11,8 +11,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::diff::{self, DiffState, FileSnapshot};
+
 pub const WATCHER_CHANGE_EVENT: &str = "watcher-change";
 pub const WATCHER_STATE_EVENT: &str = "watcher-state";
+pub const DIFF_STATE_EVENT: &str = "diff-state";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -22,7 +25,7 @@ pub enum WatcherStatus {
     Error,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FileChangeStatus {
     Added,
@@ -42,6 +45,7 @@ pub struct WatcherState {
     pub project_path: Option<String>,
     pub status: WatcherStatus,
     pub records: Vec<FileChangeRecord>,
+    pub diff: DiffState,
     pub error: Option<String>,
 }
 
@@ -51,6 +55,7 @@ impl Default for WatcherState {
             project_path: None,
             status: WatcherStatus::Idle,
             records: Vec::new(),
+            diff: DiffState::idle(),
             error: None,
         }
     }
@@ -64,6 +69,7 @@ struct Runtime {
 
 pub struct AppState {
     runtime: Arc<Mutex<Runtime>>,
+    publication: Arc<Mutex<()>>,
 }
 
 impl Default for AppState {
@@ -74,6 +80,7 @@ impl Default for AppState {
                 state: WatcherState::default(),
                 watcher: None,
             })),
+            publication: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -94,6 +101,115 @@ impl WatcherHandle {
 
 fn lock_runtime(state: &AppState) -> MutexGuard<'_, Runtime> {
     state.runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn claim_start_generation(
+    runtime: &Arc<Mutex<Runtime>>,
+    publication: &Arc<Mutex<()>>,
+) -> (Option<WatcherHandle>, u64) {
+    let _publication = publication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut runtime = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime.generation = runtime.generation.wrapping_add(1);
+    (runtime.watcher.take(), runtime.generation)
+}
+
+/// Prepare and publish one event while holding the publication gate.
+///
+/// Generation claims use the same gate, so a newer command cannot invalidate
+/// the operation after the final generation check but before `publish` runs.
+/// The runtime mutex is released before calling `publish` to avoid holding
+/// mutable application state across Tauri event delivery.
+fn publish_if_current<T, Prepare, Publish>(
+    runtime: &Arc<Mutex<Runtime>>,
+    publication: &Arc<Mutex<()>>,
+    generation: u64,
+    prepare: Prepare,
+    publish: Publish,
+) -> bool
+where
+    Prepare: FnOnce(&mut Runtime) -> Option<T>,
+    Publish: FnOnce(T),
+{
+    let _publication = publication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let payload = {
+        let Ok(mut runtime) = runtime.lock() else {
+            return false;
+        };
+        if runtime.generation != generation {
+            return false;
+        }
+        prepare(&mut runtime)
+    };
+    let Some(payload) = payload else {
+        return false;
+    };
+    publish(payload);
+    true
+}
+
+fn superseded_start_error() -> String {
+    "Project watch start was superseded by a newer command".to_string()
+}
+
+fn finish_start_error(
+    app: &AppHandle,
+    runtime: &Arc<Mutex<Runtime>>,
+    publication: &Arc<Mutex<()>>,
+    generation: u64,
+    error: String,
+) -> Result<WatcherState, String> {
+    let published = publish_if_current(
+        runtime,
+        publication,
+        generation,
+        |runtime| {
+            runtime.state.status = WatcherStatus::Error;
+            runtime.state.error = Some(error.clone());
+            Some(runtime.state.clone())
+        },
+        |state| {
+            let _ = app.emit(WATCHER_STATE_EVENT, state);
+        },
+    );
+    if published {
+        Err(error)
+    } else {
+        Err(superseded_start_error())
+    }
+}
+
+fn install_start_state(
+    runtime: &Arc<Mutex<Runtime>>,
+    generation: u64,
+    state: WatcherState,
+) -> bool {
+    let Ok(mut runtime) = runtime.lock() else {
+        return false;
+    };
+    if runtime.generation != generation {
+        return false;
+    }
+    runtime.state = state;
+    true
+}
+
+fn install_watcher(
+    runtime: &Arc<Mutex<Runtime>>,
+    generation: u64,
+    watcher: WatcherHandle,
+) -> Result<WatcherState, WatcherHandle> {
+    let Ok(mut runtime) = runtime.lock() else {
+        return Err(watcher);
+    };
+    if runtime.generation != generation {
+        return Err(watcher);
+    }
+    runtime.watcher = Some(watcher);
+    Ok(runtime.state.clone())
 }
 
 /// Validate a folder selected by the user and return its canonical path.
@@ -144,6 +260,17 @@ pub fn normalize_relative_path(root: &Path, path: &Path) -> Result<String, Strin
 
     if relative.as_os_str().is_empty() {
         return Err("The selected project root is not a file".to_string());
+    }
+
+    // Reject lexical traversal before filtering components so an outside path
+    // cannot be relabeled as an in-root path after `..` is dropped.
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        return Err("Changed path is outside the selected project".to_string());
     }
 
     let normalized = relative
@@ -404,9 +531,10 @@ fn set_runtime_error(runtime: &Arc<Mutex<Runtime>>, generation: u64, error: Stri
 
 fn start_worker(
     root: PathBuf,
-    baseline: BTreeSet<String>,
+    baseline: FileSnapshot,
     app: AppHandle,
     runtime: Arc<Mutex<Runtime>>,
+    publication: Arc<Mutex<()>>,
     generation: u64,
 ) -> Result<WatcherHandle, String> {
     let (event_sender, event_receiver) = mpsc::channel::<notify::Result<Event>>();
@@ -426,6 +554,7 @@ fn start_worker(
             baseline,
             app,
             runtime,
+            publication,
             generation,
             event_receiver,
             stop_receiver,
@@ -442,14 +571,16 @@ fn start_worker(
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     root: PathBuf,
-    baseline: BTreeSet<String>,
+    baseline: FileSnapshot,
     app: AppHandle,
     runtime: Arc<Mutex<Runtime>>,
+    publication: Arc<Mutex<()>>,
     generation: u64,
     event_receiver: Receiver<notify::Result<Event>>,
     stop_receiver: Receiver<()>,
     _watcher: RecommendedWatcher,
 ) {
+    let baseline_paths = baseline.files.keys().cloned().collect::<BTreeSet<_>>();
     loop {
         if stop_receiver.try_recv().is_ok() {
             break;
@@ -459,7 +590,15 @@ fn run_worker(
             Ok(Ok(event)) => event,
             Ok(Err(error)) => {
                 if let Some(state) = set_runtime_error(&runtime, generation, error.to_string()) {
-                    let _ = app.emit(WATCHER_STATE_EVENT, state);
+                    let _ = publish_if_current(
+                        &runtime,
+                        &publication,
+                        generation,
+                        |_| Some(state),
+                        |state| {
+                            let _ = app.emit(WATCHER_STATE_EVENT, state);
+                        },
+                    );
                 }
                 continue;
             }
@@ -483,9 +622,9 @@ fn run_worker(
             events
                 .iter()
                 .inspect(|event| {
-                    affected_paths.extend(affected_paths_for_event(&root, &baseline, event));
+                    affected_paths.extend(affected_paths_for_event(&root, &baseline_paths, event));
                 })
-                .flat_map(|event| changes_for_event(&root, &baseline, event)),
+                .flat_map(|event| changes_for_event(&root, &baseline_paths, event)),
         );
 
         let changed_paths = changes
@@ -497,15 +636,78 @@ fn run_worker(
                 continue;
             }
             if let Some(state) = clear_runtime_path(&runtime, generation, &path) {
-                let _ = app.emit(WATCHER_STATE_EVENT, state);
+                let _ = publish_if_current(
+                    &runtime,
+                    &publication,
+                    generation,
+                    |_| Some(state),
+                    |state| {
+                        let _ = app.emit(WATCHER_STATE_EVENT, state);
+                    },
+                );
             }
         }
         for change in changes {
             if update_runtime(&runtime, generation, &change) {
-                let _ = app.emit(WATCHER_CHANGE_EVENT, change);
+                let _ = publish_if_current(
+                    &runtime,
+                    &publication,
+                    generation,
+                    |_| Some(change),
+                    |change| {
+                        let _ = app.emit(WATCHER_CHANGE_EVENT, change);
+                    },
+                );
             }
         }
+
+        if let Some(state) = refresh_runtime_diff(&runtime, generation, &root, &baseline) {
+            let _ = publish_if_current(
+                &runtime,
+                &publication,
+                generation,
+                |_| Some(state),
+                |state| {
+                    let _ = app.emit(DIFF_STATE_EVENT, state.diff.clone());
+                    let _ = app.emit(WATCHER_STATE_EVENT, state);
+                },
+            );
+        }
     }
+}
+
+fn refresh_runtime_diff(
+    runtime: &Arc<Mutex<Runtime>>,
+    generation: u64,
+    root: &Path,
+    baseline: &FileSnapshot,
+) -> Option<WatcherState> {
+    let state = diff::state_for_baseline(root, baseline);
+    let Ok(mut runtime) = runtime.lock() else {
+        return None;
+    };
+    if runtime.generation != generation {
+        return None;
+    }
+    let next_records = state
+        .files
+        .iter()
+        .map(|file| FileChangeRecord {
+            path: file.path.clone(),
+            status: file.status,
+        })
+        .collect::<Vec<_>>();
+    let next_error = state.error.clone();
+    if runtime.state.diff == state
+        && runtime.state.records == next_records
+        && runtime.state.error == next_error
+    {
+        return None;
+    }
+    runtime.state.diff = state;
+    runtime.state.records = next_records;
+    runtime.state.error = next_error;
+    Some(runtime.state.clone())
 }
 
 #[tauri::command]
@@ -514,75 +716,121 @@ pub fn get_watcher_state(state: State<'_, AppState>) -> WatcherState {
 }
 
 #[tauri::command]
+pub fn get_diff_state(state: State<'_, AppState>) -> DiffState {
+    lock_runtime(&state).state.diff.clone()
+}
+
+#[tauri::command]
 pub fn start_watching(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<WatcherState, String> {
-    let root = validate_project_root(&path)?;
-    let baseline = initial_snapshot(&root)?;
-
-    let (old_watcher, generation) = {
-        let mut runtime = lock_runtime(&state);
-        runtime.generation = runtime.generation.wrapping_add(1);
-        (runtime.watcher.take(), runtime.generation)
-    };
+    // Claim the operation before validation or snapshot capture.  A stop or
+    // newer start can therefore invalidate this command while that work is in
+    // progress, before it can publish any selected project state.
+    let (old_watcher, generation) = claim_start_generation(&state.runtime, &state.publication);
     if let Some(old_watcher) = old_watcher {
         old_watcher.stop_and_join();
     }
 
-    {
-        let mut runtime = lock_runtime(&state);
-        runtime.state = WatcherState {
-            project_path: Some(root.to_string_lossy().into_owned()),
-            status: WatcherStatus::Watching,
-            records: Vec::new(),
-            error: None,
-        };
+    let root = match validate_project_root(&path) {
+        Ok(root) => root,
+        Err(error) => {
+            return finish_start_error(&app, &state.runtime, &state.publication, generation, error)
+        }
+    };
+    let baseline = match diff::capture_snapshot(&root) {
+        Ok(baseline) => baseline,
+        Err(error) => {
+            return finish_start_error(&app, &state.runtime, &state.publication, generation, error)
+        }
+    };
+
+    let initial_state = WatcherState {
+        project_path: Some(root.to_string_lossy().into_owned()),
+        status: WatcherStatus::Watching,
+        records: Vec::new(),
+        diff: diff::state_for_baseline(&root, &baseline),
+        error: None,
+    };
+    if !install_start_state(&state.runtime, generation, initial_state) {
+        // Another command superseded this start while validation or snapshot
+        // capture was in progress.  Leave the newer command's state and
+        // handle intact.
+        return Err(superseded_start_error());
     }
 
-    match start_worker(root.clone(), baseline, app.clone(), state.runtime.clone(), generation) {
-        Ok(watcher) => {
-            let current = {
-                let mut runtime = lock_runtime(&state);
-                runtime.watcher = Some(watcher);
-                runtime.state.clone()
-            };
-            let _ = app.emit(WATCHER_STATE_EVENT, current.clone());
-            Ok(current)
-        }
+    match start_worker(
+        root.clone(),
+        baseline,
+        app.clone(),
+        state.runtime.clone(),
+        state.publication.clone(),
+        generation,
+    ) {
+        Ok(watcher) => match install_watcher(&state.runtime, generation, watcher) {
+            Ok(mut current) => {
+                let published = publish_if_current(
+                    &state.runtime,
+                    &state.publication,
+                    generation,
+                    |runtime| {
+                        // A same-generation worker may have advanced runtime.state
+                        // after install_watcher captured `current`.  Read the state
+                        // again under the publication gate so start-success cannot
+                        // publish an older snapshot.
+                        current = runtime.state.clone();
+                        Some(current.clone())
+                    },
+                    |current| {
+                        let _ = app.emit(WATCHER_STATE_EVENT, current.clone());
+                        let _ = app.emit(DIFF_STATE_EVENT, current.diff.clone());
+                    },
+                );
+                if published {
+                    Ok(current)
+                } else {
+                    Err(superseded_start_error())
+                }
+            }
+            Err(stale_watcher) => {
+                // The worker was created after a newer command took over.
+                // Stop it before returning, without touching newer state.
+                stale_watcher.stop_and_join();
+                Err(superseded_start_error())
+            }
+        },
         Err(error) => {
-            let current = {
-                let mut runtime = lock_runtime(&state);
-                runtime.state.status = WatcherStatus::Error;
-                runtime.state.error = Some(error.clone());
-                runtime.state.clone()
-            };
-            let _ = app.emit(WATCHER_STATE_EVENT, current);
-            Err(error)
+            finish_start_error(&app, &state.runtime, &state.publication, generation, error)
         }
     }
 }
 
 #[tauri::command]
 pub fn stop_watching(app: AppHandle, state: State<'_, AppState>) -> WatcherState {
-    let (old_watcher, generation) = {
-        let mut runtime = lock_runtime(&state);
-        runtime.generation = runtime.generation.wrapping_add(1);
-        (runtime.watcher.take(), runtime.generation)
-    };
+    let (old_watcher, generation) = claim_start_generation(&state.runtime, &state.publication);
     if let Some(old_watcher) = old_watcher {
         old_watcher.stop_and_join();
     }
 
-    let current = {
-        let mut runtime = lock_runtime(&state);
-        if runtime.generation == generation {
+    let _ = publish_if_current(
+        &state.runtime,
+        &state.publication,
+        generation,
+        |runtime| {
             runtime.state = WatcherState::default();
-        }
+            Some(runtime.state.clone())
+        },
+        |state| {
+            let _ = app.emit(WATCHER_STATE_EVENT, state);
+        },
+    );
+
+    let current = {
+        let runtime = lock_runtime(&state);
         runtime.state.clone()
     };
-    let _ = app.emit(WATCHER_STATE_EVENT, current.clone());
     current
 }
 
@@ -620,6 +868,8 @@ mod tests {
         fs::write(&file, "export {};").unwrap();
         assert_eq!(normalize_relative_path(&project.0, &file).unwrap(), "src/main.ts");
         assert!(normalize_relative_path(&project.0, &std::env::temp_dir().join("outside.ts")).is_err());
+        let lexical_outside = project.0.join("..").join("outside.ts");
+        assert!(normalize_relative_path(&project.0, &lexical_outside).is_err());
     }
 
     #[test]
@@ -733,6 +983,191 @@ mod tests {
     }
 
     #[test]
+    fn start_claims_generation_before_slow_snapshot_and_rejects_stale_install() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 0,
+            state: WatcherState::default(),
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+        let (capture_started_sender, capture_started_receiver) = mpsc::sync_channel(0);
+        let (release_capture_sender, release_capture_receiver) = mpsc::sync_channel(0);
+        let operation_runtime = runtime.clone();
+        let operation_publication = publication.clone();
+
+        let operation = std::thread::spawn(move || {
+            let (old_watcher, generation) =
+                claim_start_generation(&operation_runtime, &operation_publication);
+            assert!(old_watcher.is_none());
+            capture_started_sender.send(generation).unwrap();
+            release_capture_receiver.recv().unwrap();
+
+            install_start_state(
+                &operation_runtime,
+                generation,
+                WatcherState {
+                    project_path: Some("stale-project".into()),
+                    status: WatcherStatus::Watching,
+                    records: Vec::new(),
+                    diff: DiffState::idle(),
+                    error: None,
+                },
+            )
+        });
+
+        let first_generation = capture_started_receiver.recv().unwrap();
+        let (old_watcher, second_generation) = claim_start_generation(&runtime, &publication);
+        assert!(old_watcher.is_none());
+        assert_eq!(second_generation, first_generation.wrapping_add(1));
+        release_capture_sender.send(()).unwrap();
+
+        assert!(!operation.join().unwrap());
+        let runtime = runtime.lock().unwrap();
+        let state = &runtime.state;
+        assert_eq!(runtime.generation, second_generation);
+        assert!(state.project_path.is_none());
+        assert_eq!(state.status, WatcherStatus::Idle);
+        assert!(state.records.is_empty());
+    }
+
+    #[test]
+    fn stale_start_success_event_is_suppressed_after_newer_claim() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 0,
+            state: WatcherState::default(),
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+        let (_, stale_generation) = claim_start_generation(&runtime, &publication);
+        let (_, current_generation) = claim_start_generation(&runtime, &publication);
+        let mut events = Vec::new();
+
+        let published = publish_if_current(
+            &runtime,
+            &publication,
+            stale_generation,
+            |_| Some("start-success"),
+            |event| events.push(event),
+        );
+
+        assert!(!published);
+        assert!(events.is_empty());
+        assert_eq!(runtime.lock().unwrap().generation, current_generation);
+    }
+
+    #[test]
+    fn start_success_publication_uses_latest_same_generation_worker_state() {
+        let project = TempProject::new();
+        let file = project.0.join("main.ts");
+        fs::write(&file, "one\n").unwrap();
+        let baseline = diff::capture_snapshot(&project.0).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 1,
+            state: WatcherState {
+                project_path: Some(project.0.to_string_lossy().into_owned()),
+                status: WatcherStatus::Watching,
+                records: Vec::new(),
+                diff: diff::state_for_baseline(&project.0, &baseline),
+                error: None,
+            },
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+        let (stop, _receiver) = mpsc::channel();
+        let captured = install_watcher(&runtime, 1, WatcherHandle { stop, join: None }).unwrap();
+
+        // Model a same-generation worker update between installation and the
+        // start-success publication.
+        fs::write(&file, "two\n").unwrap();
+        assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_some());
+        let latest = runtime.lock().unwrap().state.clone();
+
+        let mut current = captured;
+        let mut emitted = None;
+        let published = publish_if_current(
+            &runtime,
+            &publication,
+            1,
+            |runtime| {
+                current = runtime.state.clone();
+                Some(current.clone())
+            },
+            |state| emitted = Some(state),
+        );
+
+        assert!(published);
+        let emitted = emitted.expect("start-success state should be emitted");
+        assert_eq!(current.records, latest.records);
+        assert_eq!(current.diff, latest.diff);
+        assert_eq!(emitted.records, latest.records);
+        assert_eq!(emitted.diff, latest.diff);
+    }
+
+    #[test]
+    fn stale_start_error_event_is_suppressed_after_newer_claim() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 0,
+            state: WatcherState::default(),
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+        let (_, stale_generation) = claim_start_generation(&runtime, &publication);
+        let (_, current_generation) = claim_start_generation(&runtime, &publication);
+        let mut events = Vec::new();
+
+        let published = publish_if_current(
+            &runtime,
+            &publication,
+            stale_generation,
+            |runtime| {
+                runtime.state.status = WatcherStatus::Error;
+                Some("start-error")
+            },
+            |event| events.push(event),
+        );
+
+        assert!(!published);
+        assert!(events.is_empty());
+        assert_eq!(runtime.lock().unwrap().generation, current_generation);
+        assert_eq!(runtime.lock().unwrap().state.status, WatcherStatus::Idle);
+    }
+
+    #[test]
+    fn stale_stop_event_is_suppressed_after_newer_claim() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 0,
+            state: WatcherState {
+                project_path: Some("current".into()),
+                status: WatcherStatus::Watching,
+                records: Vec::new(),
+                diff: DiffState::idle(),
+                error: None,
+            },
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+        let (_, stale_generation) = claim_start_generation(&runtime, &publication);
+        let (_, current_generation) = claim_start_generation(&runtime, &publication);
+        let mut events = Vec::new();
+
+        let published = publish_if_current(
+            &runtime,
+            &publication,
+            stale_generation,
+            |runtime| {
+                runtime.state = WatcherState::default();
+                Some("stop")
+            },
+            |event| events.push(event),
+        );
+
+        assert!(!published);
+        assert!(events.is_empty());
+        assert_eq!(runtime.lock().unwrap().generation, current_generation);
+        assert_eq!(runtime.lock().unwrap().state.project_path.as_deref(), Some("current"));
+    }
+
+    #[test]
     fn stale_generation_cannot_update_a_switched_project() {
         let runtime = Arc::new(Mutex::new(Runtime {
             generation: 2,
@@ -740,6 +1175,7 @@ mod tests {
                 project_path: Some("new".into()),
                 status: WatcherStatus::Watching,
                 records: Vec::new(),
+                diff: DiffState::idle(),
                 error: None,
             },
             watcher: None,
@@ -749,6 +1185,84 @@ mod tests {
             status: FileChangeStatus::Modified,
         };
         assert!(!update_runtime(&runtime, 1, &stale));
+        assert!(runtime.lock().unwrap().state.records.is_empty());
+    }
+
+    #[test]
+    fn stale_generation_cannot_publish_a_diff_for_a_switched_project() {
+        let project = TempProject::new();
+        let file = project.0.join("main.ts");
+        fs::write(&file, "one\n").unwrap();
+        let baseline = diff::capture_snapshot(&project.0).unwrap();
+        fs::write(&file, "two\n").unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 2,
+            state: WatcherState {
+                project_path: Some("new".into()),
+                status: WatcherStatus::Watching,
+                records: Vec::new(),
+                diff: DiffState::idle(),
+                error: None,
+            },
+            watcher: None,
+        }));
+        assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_none());
+        assert_eq!(runtime.lock().unwrap().state.diff, DiffState::idle());
+    }
+
+    #[test]
+    fn stale_generation_cannot_install_start_state_or_watcher() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 2,
+            state: WatcherState {
+                project_path: Some("new".into()),
+                status: WatcherStatus::Watching,
+                records: Vec::new(),
+                diff: DiffState::idle(),
+                error: None,
+            },
+            watcher: None,
+        }));
+        let stale_state = WatcherState {
+            project_path: Some("old".into()),
+            status: WatcherStatus::Watching,
+            records: Vec::new(),
+            diff: DiffState::idle(),
+            error: None,
+        };
+        assert!(!install_start_state(&runtime, 1, stale_state));
+        assert_eq!(runtime.lock().unwrap().state.project_path.as_deref(), Some("new"));
+
+        let (stop, _receiver) = mpsc::channel();
+        let stale_watcher = WatcherHandle {
+            stop,
+            join: None,
+        };
+        assert!(install_watcher(&runtime, 1, stale_watcher).is_err());
+        assert!(runtime.lock().unwrap().watcher.is_none());
+    }
+
+    #[test]
+    fn diff_refresh_clears_a_spurious_record_when_content_matches_baseline() {
+        let project = TempProject::new();
+        let file = project.0.join("main.ts");
+        fs::write(&file, "one\n").unwrap();
+        let baseline = diff::capture_snapshot(&project.0).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 1,
+            state: WatcherState {
+                project_path: Some(project.0.to_string_lossy().into_owned()),
+                status: WatcherStatus::Watching,
+                records: vec![FileChangeRecord {
+                    path: "main.ts".into(),
+                    status: FileChangeStatus::Modified,
+                }],
+                diff: diff::state_for_baseline(&project.0, &baseline),
+                error: None,
+            },
+            watcher: None,
+        }));
+        assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_some());
         assert!(runtime.lock().unwrap().state.records.is_empty());
     }
 
@@ -765,6 +1279,7 @@ mod tests {
                 project_path: Some(project.0.to_string_lossy().into_owned()),
                 status: WatcherStatus::Watching,
                 records: Vec::new(),
+                diff: DiffState::idle(),
                 error: None,
             },
             watcher: None,
