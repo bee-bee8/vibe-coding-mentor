@@ -1,17 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
-import {
-  DIFF_STATE_EVENT,
-  type DiffState,
-} from '../types/diff';
+import type { DiffState, FilePreview } from '../types/diff';
 
 export async function getDiffState(): Promise<DiffState> {
   return invoke<DiffState>('get_diff_state');
 }
 
-export async function subscribeToDiff(
-  onState: (state: DiffState) => void,
-): Promise<UnlistenFn> {
-  return listen<DiffState>(DIFF_STATE_EVENT, (event) => onState(event.payload));
+export async function getFilePreview(path: string): Promise<FilePreview> {
+  return invoke<FilePreview>('get_file_preview', { path });
 }

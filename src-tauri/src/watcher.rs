@@ -64,6 +64,7 @@ impl Default for WatcherState {
 struct Runtime {
     generation: u64,
     state: WatcherState,
+    baseline: Option<FileSnapshot>,
     watcher: Option<WatcherHandle>,
 }
 
@@ -78,6 +79,7 @@ impl Default for AppState {
             runtime: Arc::new(Mutex::new(Runtime {
                 generation: 0,
                 state: WatcherState::default(),
+                baseline: None,
                 watcher: None,
             })),
             publication: Arc::new(Mutex::new(())),
@@ -112,6 +114,7 @@ fn claim_start_generation(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut runtime = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     runtime.generation = runtime.generation.wrapping_add(1);
+    runtime.baseline = None;
     (runtime.watcher.take(), runtime.generation)
 }
 
@@ -721,6 +724,33 @@ pub fn get_diff_state(state: State<'_, AppState>) -> DiffState {
 }
 
 #[tauri::command]
+pub fn get_file_preview(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<diff::FilePreview, String> {
+    let (generation, project_path, baseline) = {
+        let runtime = lock_runtime(&state);
+        let project_path = runtime
+            .state
+            .project_path
+            .clone()
+            .ok_or_else(|| "No project is currently being watched".to_string())?;
+        let baseline = runtime
+            .baseline
+            .clone()
+            .ok_or_else(|| "The current watch snapshot is unavailable".to_string())?;
+        (runtime.generation, project_path, baseline)
+    };
+
+    let preview = diff::file_preview(Path::new(&project_path), &baseline, &path)?;
+    let runtime = lock_runtime(&state);
+    if runtime.generation != generation || runtime.baseline.is_none() {
+        return Err("The watch session changed while reading the selected file".to_string());
+    }
+    Ok(preview)
+}
+
+#[tauri::command]
 pub fn start_watching(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -759,6 +789,15 @@ pub fn start_watching(
         // capture was in progress.  Leave the newer command's state and
         // handle intact.
         return Err(superseded_start_error());
+    }
+    {
+        let Ok(mut runtime) = state.runtime.lock() else {
+            return Err("Unable to store the watch-start snapshot".to_string());
+        };
+        if runtime.generation != generation {
+            return Err(superseded_start_error());
+        }
+        runtime.baseline = Some(baseline.clone());
     }
 
     match start_worker(
@@ -802,6 +841,11 @@ pub fn start_watching(
             }
         },
         Err(error) => {
+            if let Ok(mut runtime) = state.runtime.lock() {
+                if runtime.generation == generation {
+                    runtime.baseline = None;
+                }
+            }
             finish_start_error(&app, &state.runtime, &state.publication, generation, error)
         }
     }
@@ -987,6 +1031,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(Runtime {
             generation: 0,
             state: WatcherState::default(),
+            baseline: None,
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1035,6 +1080,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(Runtime {
             generation: 0,
             state: WatcherState::default(),
+            baseline: None,
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1056,6 +1102,23 @@ mod tests {
     }
 
     #[test]
+    fn a_new_generation_invalidates_the_previous_preview_baseline() {
+        let runtime = Arc::new(Mutex::new(Runtime {
+            generation: 3,
+            state: WatcherState::default(),
+            baseline: Some(FileSnapshot::default()),
+            watcher: None,
+        }));
+        let publication = Arc::new(Mutex::new(()));
+
+        let (_, generation) = claim_start_generation(&runtime, &publication);
+
+        let runtime = runtime.lock().unwrap();
+        assert_eq!(runtime.generation, generation);
+        assert!(runtime.baseline.is_none());
+    }
+
+    #[test]
     fn start_success_publication_uses_latest_same_generation_worker_state() {
         let project = TempProject::new();
         let file = project.0.join("main.ts");
@@ -1070,6 +1133,7 @@ mod tests {
                 diff: diff::state_for_baseline(&project.0, &baseline),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1108,6 +1172,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(Runtime {
             generation: 0,
             state: WatcherState::default(),
+            baseline: None,
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1143,6 +1208,7 @@ mod tests {
                 diff: DiffState::idle(),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1178,6 +1244,7 @@ mod tests {
                 diff: DiffState::idle(),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         let stale = FileChangeRecord {
@@ -1204,6 +1271,7 @@ mod tests {
                 diff: DiffState::idle(),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_none());
@@ -1221,6 +1289,7 @@ mod tests {
                 diff: DiffState::idle(),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         let stale_state = WatcherState {
@@ -1260,6 +1329,7 @@ mod tests {
                 diff: diff::state_for_baseline(&project.0, &baseline),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
         assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_some());
@@ -1282,6 +1352,7 @@ mod tests {
                 diff: DiffState::idle(),
                 error: None,
             },
+            baseline: None,
             watcher: None,
         }));
 

@@ -50,6 +50,16 @@ pub struct FileDiffRecord {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct FilePreview {
+    pub path: String,
+    pub status: FileChangeStatus,
+    pub content_status: ContentStatus,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DiffState {
     pub project_path: Option<String>,
     pub source: DiffSource,
@@ -423,12 +433,115 @@ fn read_head_file(repo_root: &Path, path: &str) -> Option<SnapshotEntry> {
 }
 
 fn read_worktree_file(path: &Path) -> Option<SnapshotEntry> {
-    if !path.exists() {
-        return None;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(SnapshotEntry::Unavailable),
+    };
+    if !metadata.is_file() {
+        return Some(SnapshotEntry::Unavailable);
     }
     Some(match fs::read(path) {
         Ok(content) => SnapshotEntry::Content(content),
         Err(_) => SnapshotEntry::Unavailable,
+    })
+}
+
+fn has_symlink_component(root: &Path, requested: &Path) -> Result<bool, String> {
+    let mut candidate = root.to_path_buf();
+    for component in requested.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        candidate.push(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("Unable to inspect selected file: {error}")),
+        }
+    }
+    Ok(false)
+}
+
+fn preview_relative_path(root: &Path, path: &str) -> Result<String, String> {
+    let requested = Path::new(path);
+    if requested.as_os_str().is_empty()
+        || requested.is_absolute()
+        || requested.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
+    {
+        return Err("Selected file path is outside the project".to_string());
+    }
+
+    let candidate = root.join(requested);
+    if has_symlink_component(root, requested)? {
+        return Err("Selected file path cannot contain symlinks".to_string());
+    }
+    if candidate.exists() {
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|error| format!("Unable to read selected file: {error}"))?;
+        if !canonical.starts_with(root) {
+            return Err("Selected file path is outside the project".to_string());
+        }
+    }
+
+    relative_path(root, &candidate)
+        .ok_or_else(|| "Selected file path is outside the project".to_string())
+}
+
+fn preview_text(entry: Option<&SnapshotEntry>, content_status: &ContentStatus) -> Option<String> {
+    if *content_status != ContentStatus::Text {
+        return None;
+    }
+    match entry {
+        Some(SnapshotEntry::Content(content)) => String::from_utf8(content.clone()).ok(),
+        _ => None,
+    }
+}
+
+/// Read only the selected file's watch-start and current contents.
+///
+/// The caller supplies the in-memory watch-start snapshot.  Current content is
+/// read from the selected path only; no whole-project data is returned.
+pub fn file_preview(
+    root: &Path,
+    baseline: &FileSnapshot,
+    path: &str,
+) -> Result<FilePreview, String> {
+    let root = canonical_root(root)?;
+    let relative = preview_relative_path(&root, path)?;
+    let before = baseline.files.get(&relative);
+    let after_path = root.join(relative.replace('/', &std::path::MAIN_SEPARATOR.to_string()));
+    let after = read_worktree_file(&after_path);
+
+    let status = match (before, after.as_ref()) {
+        (None, None) => return Err("Selected file is no longer part of the current change".to_string()),
+        (Some(SnapshotEntry::Content(before)), Some(SnapshotEntry::Content(after)))
+            if before == after =>
+        {
+            return Err("Selected file is no longer part of the current change".to_string());
+        }
+        (Some(SnapshotEntry::Unavailable), Some(SnapshotEntry::Unavailable)) => {
+            return Err("Selected file is no longer part of the current change".to_string());
+        }
+        (None, Some(_)) => FileChangeStatus::Added,
+        (Some(_), None) => FileChangeStatus::Deleted,
+        (Some(_), Some(_)) => FileChangeStatus::Modified,
+    };
+
+    let record = file_diff(relative.clone(), status, before, after.as_ref());
+    Ok(FilePreview {
+        path: relative,
+        status: record.status,
+        before: preview_text(before, &record.content_status),
+        after: preview_text(after.as_ref(), &record.content_status),
+        content_status: record.content_status,
     })
 }
 
@@ -763,5 +876,149 @@ mod tests {
     fn normalize_git_path_rejects_lexical_parent_traversal() {
         let project = TempProject::new();
         assert!(normalize_git_path(&project.0, &project.0, "../outside.ts").is_none());
+    }
+
+    #[test]
+    fn file_preview_returns_watch_start_and_current_text_for_each_status() {
+        let project = TempProject::new();
+        fs::write(project.0.join("modified.ts"), "before\n").unwrap();
+        fs::write(project.0.join("deleted.ts"), "gone\n").unwrap();
+        let baseline = capture_snapshot(&project.0).unwrap();
+
+        fs::write(project.0.join("modified.ts"), "after\n").unwrap();
+        fs::write(project.0.join("added.ts"), "new\n").unwrap();
+        fs::remove_file(project.0.join("deleted.ts")).unwrap();
+
+        let modified = file_preview(&project.0, &baseline, "modified.ts").unwrap();
+        assert_eq!(modified.status, FileChangeStatus::Modified);
+        assert_eq!(modified.content_status, ContentStatus::Text);
+        assert_eq!(modified.before.as_deref(), Some("before\n"));
+        assert_eq!(modified.after.as_deref(), Some("after\n"));
+
+        let added = file_preview(&project.0, &baseline, "added.ts").unwrap();
+        assert_eq!(added.status, FileChangeStatus::Added);
+        assert_eq!(added.before, None);
+        assert_eq!(added.after.as_deref(), Some("new\n"));
+
+        let deleted = file_preview(&project.0, &baseline, "deleted.ts").unwrap();
+        assert_eq!(deleted.status, FileChangeStatus::Deleted);
+        assert_eq!(deleted.before.as_deref(), Some("gone\n"));
+        assert_eq!(deleted.after, None);
+    }
+
+    #[test]
+    fn file_preview_marks_binary_and_unavailable_without_returning_bytes() {
+        let project = TempProject::new();
+        fs::write(project.0.join("binary.bin"), [0u8, 1u8]).unwrap();
+        let baseline = capture_snapshot(&project.0).unwrap();
+        fs::write(project.0.join("binary.bin"), [0u8, 2u8]).unwrap();
+
+        let binary = file_preview(&project.0, &baseline, "binary.bin").unwrap();
+        assert_eq!(binary.content_status, ContentStatus::Binary);
+        assert_eq!(binary.before, None);
+        assert_eq!(binary.after, None);
+
+        let unavailable_baseline = snapshot(&[(
+            "locked.ts",
+            SnapshotEntry::Unavailable,
+        )]);
+        fs::write(project.0.join("locked.ts"), "current\n").unwrap();
+        let unavailable = file_preview(&project.0, &unavailable_baseline, "locked.ts").unwrap();
+        assert_eq!(unavailable.content_status, ContentStatus::Unavailable);
+        assert_eq!(unavailable.before, None);
+        assert_eq!(unavailable.after, None);
+    }
+
+    #[test]
+    fn file_preview_rejects_outside_paths_and_reverted_or_missing_files() {
+        let project = TempProject::new();
+        fs::write(project.0.join("same.ts"), "same\n").unwrap();
+        let baseline = capture_snapshot(&project.0).unwrap();
+        assert!(file_preview(&project.0, &baseline, "same.ts").is_err());
+        assert!(file_preview(&project.0, &baseline, "../outside.ts").is_err());
+        assert!(file_preview(&project.0, &baseline, "missing.ts").is_err());
+    }
+
+    #[test]
+    fn symlink_component_helper_allows_normal_and_missing_paths() {
+        let project = TempProject::new();
+        fs::create_dir_all(project.0.join("src")).unwrap();
+        fs::write(project.0.join("src/main.ts"), "current\n").unwrap();
+
+        assert!(!has_symlink_component(&project.0, Path::new("src/main.ts")).unwrap());
+        assert!(!has_symlink_component(&project.0, Path::new("src/missing.ts")).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn create_symlink(target: &Path, link: &Path, _directory: bool) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_symlink(target: &Path, link: &Path, directory: bool) -> std::io::Result<()> {
+        if directory {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    #[cfg(windows)]
+    fn skip_if_symlink_permission_denied(error: &std::io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(5 | 1314))
+    }
+
+    #[test]
+    fn symlink_components_are_rejected_even_when_target_is_inside_root() {
+        let project = TempProject::new();
+        fs::create_dir_all(project.0.join("real")).unwrap();
+        fs::write(project.0.join("real/target.ts"), "target\n").unwrap();
+
+        if let Err(error) = create_symlink(
+            &project.0.join("real"),
+            &project.0.join("linked"),
+            true,
+        ) {
+            #[cfg(windows)]
+            if skip_if_symlink_permission_denied(&error) {
+                return;
+            }
+            panic!("unable to create directory symlink: {error}");
+        }
+
+        assert!(has_symlink_component(&project.0, Path::new("linked/missing.ts")).unwrap());
+        assert!(preview_relative_path(&project.0, "linked/missing.ts").is_err());
+        assert!(preview_relative_path(&project.0, "linked/target.ts").is_err());
+
+        if let Err(error) = create_symlink(
+            &project.0.join("real/target.ts"),
+            &project.0.join("linked.ts"),
+            false,
+        ) {
+            #[cfg(windows)]
+            if skip_if_symlink_permission_denied(&error) {
+                return;
+            }
+            panic!("unable to create file symlink: {error}");
+        }
+        assert!(has_symlink_component(&project.0, Path::new("linked.ts")).unwrap());
+        assert!(preview_relative_path(&project.0, "linked.ts").is_err());
+
+        let dangling_target = project.0.join("real/missing.ts");
+        if let Err(error) = create_symlink(
+            &dangling_target,
+            &project.0.join("dangling.ts"),
+            false,
+        ) {
+            #[cfg(windows)]
+            if skip_if_symlink_permission_denied(&error) {
+                return;
+            }
+            panic!("unable to create dangling file symlink: {error}");
+        }
+        let baseline = capture_snapshot(&project.0).unwrap();
+        assert!(has_symlink_component(&project.0, Path::new("dangling.ts")).unwrap());
+        assert!(preview_relative_path(&project.0, "dangling.ts").is_err());
+        assert!(file_preview(&project.0, &baseline, "dangling.ts").is_err());
     }
 }

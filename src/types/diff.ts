@@ -10,6 +10,14 @@ export interface DiffFileRecord {
   contentStatus: ContentStatus;
 }
 
+export interface FilePreview {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  contentStatus: ContentStatus;
+  before: string | null;
+  after: string | null;
+}
+
 export interface DiffState {
   projectPath: string | null;
   source: DiffSource;
