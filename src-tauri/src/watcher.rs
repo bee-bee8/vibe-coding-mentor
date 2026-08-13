@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::analysis;
 use crate::diff::{self, DiffState, FileSnapshot};
 
 pub const WATCHER_CHANGE_EVENT: &str = "watcher-change";
@@ -65,6 +66,7 @@ struct Runtime {
     generation: u64,
     state: WatcherState,
     baseline: Option<FileSnapshot>,
+    analysis: analysis::AnalysisState,
     watcher: Option<WatcherHandle>,
 }
 
@@ -80,6 +82,7 @@ impl Default for AppState {
                 generation: 0,
                 state: WatcherState::default(),
                 baseline: None,
+                analysis: analysis::AnalysisState::default(),
                 watcher: None,
             })),
             publication: Arc::new(Mutex::new(())),
@@ -115,6 +118,7 @@ fn claim_start_generation(
     let mut runtime = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     runtime.generation = runtime.generation.wrapping_add(1);
     runtime.baseline = None;
+    runtime.analysis = analysis::AnalysisState::default();
     (runtime.watcher.take(), runtime.generation)
 }
 
@@ -172,10 +176,11 @@ fn finish_start_error(
         |runtime| {
             runtime.state.status = WatcherStatus::Error;
             runtime.state.error = Some(error.clone());
-            Some(runtime.state.clone())
+            Some((runtime.state.clone(), runtime.analysis.clone()))
         },
-        |state| {
+        |(state, analysis_state)| {
             let _ = app.emit(WATCHER_STATE_EVENT, state);
+            let _ = app.emit(analysis::ANALYSIS_STATE_EVENT, analysis_state);
         },
     );
     if published {
@@ -197,6 +202,7 @@ fn install_start_state(
         return false;
     }
     runtime.state = state;
+    runtime.analysis = analysis::AnalysisState::default();
     true
 }
 
@@ -724,6 +730,11 @@ pub fn get_diff_state(state: State<'_, AppState>) -> DiffState {
 }
 
 #[tauri::command]
+pub fn get_analysis_state(state: State<'_, AppState>) -> analysis::AnalysisState {
+    lock_runtime(&state).analysis.clone()
+}
+
+#[tauri::command]
 pub fn get_file_preview(
     state: State<'_, AppState>,
     path: String,
@@ -748,6 +759,130 @@ pub fn get_file_preview(
         return Err("The watch session changed while reading the selected file".to_string());
     }
     Ok(preview)
+}
+
+/// Explicit local fallback boundary for a completed change.
+///
+/// The current snapshot is frozen before the worker is rotated to a new
+/// baseline.  An empty diff is a no-op, while a successful finalization emits
+/// exactly one analysis-state event and leaves the latest analysis available as
+/// subsequent edits accumulate.
+#[tauri::command]
+pub fn complete_change(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    metadata: Option<analysis::CompletionMetadata>,
+) -> Result<Option<analysis::ChangeAnalysis>, String> {
+    let (project_path, before, generation) = {
+        let runtime = lock_runtime(&state);
+        let project_path = runtime
+            .state
+            .project_path
+            .clone()
+            .ok_or_else(|| "No project is currently being watched".to_string())?;
+        let before = runtime
+            .baseline
+            .clone()
+            .ok_or_else(|| "The current watch snapshot is unavailable".to_string())?;
+        (project_path, before, runtime.generation)
+    };
+    let root = Path::new(&project_path);
+    let after = diff::capture_snapshot(root)?;
+    let Some(completed) = analysis::build_analysis(
+        root,
+        &before,
+        &after,
+        metadata.unwrap_or_default(),
+    )? else {
+        // The baseline is unchanged, so no record and no event are created.
+        return Ok(None);
+    };
+
+    // Invalidate and stop the old worker before rotating the baseline.  The
+    // generation check prevents an in-flight worker publication from
+    // overwriting the completed record or exposing the old baseline again.
+    let (old_watcher, next_generation) = {
+        let _publication = state
+            .publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut runtime = lock_runtime(&state);
+        if runtime.generation != generation {
+            return Err("The watch session changed while completing the change".to_string());
+        }
+        runtime.generation = runtime.generation.wrapping_add(1);
+        (runtime.watcher.take(), runtime.generation)
+    };
+    if let Some(old_watcher) = old_watcher {
+        old_watcher.stop_and_join();
+    }
+
+    {
+        let mut runtime = lock_runtime(&state);
+        if runtime.generation != next_generation {
+            return Err("The watch session changed while completing the change".to_string());
+        }
+        runtime.baseline = Some(after.clone());
+        runtime.state.records.clear();
+        runtime.state.diff = diff::state_for_baseline(root, &after);
+        runtime.state.error = runtime.state.diff.error.clone();
+        runtime.state.status = WatcherStatus::Watching;
+        runtime.analysis = analysis::AnalysisState {
+            status: analysis::AnalysisStatus::Available,
+            analysis: Some(completed.clone()),
+            error: None,
+        };
+    }
+
+    // A fresh worker observes edits after the frozen completion boundary.  If
+    // the platform refuses a second watcher, keep the completed analysis and
+    // surface the watcher error rather than discarding the record.
+    match start_worker(
+        root.to_path_buf(),
+        after,
+        app.clone(),
+        state.runtime.clone(),
+        state.publication.clone(),
+        next_generation,
+    ) {
+        Ok(watcher) => {
+            if let Err(stale_watcher) = install_watcher(&state.runtime, next_generation, watcher) {
+                stale_watcher.stop_and_join();
+            }
+        }
+        Err(error) => {
+            let _ = publish_if_current(
+                &state.runtime,
+                &state.publication,
+                next_generation,
+                |runtime| {
+                    runtime.state.status = WatcherStatus::Error;
+                    runtime.state.error = Some(error.clone());
+                    Some(runtime.state.clone())
+                },
+                |next_state| {
+                    let _ = app.emit(WATCHER_STATE_EVENT, next_state);
+                },
+            );
+        }
+    }
+
+    let published = publish_if_current(
+        &state.runtime,
+        &state.publication,
+        next_generation,
+        |runtime| Some((runtime.analysis.clone(), runtime.state.clone())),
+        |(analysis_state, current)| {
+            let _ = app.emit(analysis::ANALYSIS_STATE_EVENT, analysis_state);
+            let _ = app.emit(DIFF_STATE_EVENT, current.diff.clone());
+            let _ = app.emit(WATCHER_STATE_EVENT, current);
+        },
+    );
+    if published {
+        Ok(Some(completed))
+    } else {
+        Err(superseded_start_error())
+    }
 }
 
 #[tauri::command]
@@ -820,11 +955,12 @@ pub fn start_watching(
                         // again under the publication gate so start-success cannot
                         // publish an older snapshot.
                         current = runtime.state.clone();
-                        Some(current.clone())
+                        Some((current.clone(), runtime.analysis.clone()))
                     },
-                    |current| {
+                    |(current, analysis_state)| {
                         let _ = app.emit(WATCHER_STATE_EVENT, current.clone());
                         let _ = app.emit(DIFF_STATE_EVENT, current.diff.clone());
+                        let _ = app.emit(analysis::ANALYSIS_STATE_EVENT, analysis_state);
                     },
                 );
                 if published {
@@ -864,10 +1000,12 @@ pub fn stop_watching(app: AppHandle, state: State<'_, AppState>) -> WatcherState
         generation,
         |runtime| {
             runtime.state = WatcherState::default();
-            Some(runtime.state.clone())
+            runtime.analysis = analysis::AnalysisState::default();
+            Some((runtime.state.clone(), runtime.analysis.clone()))
         },
-        |state| {
+        |(state, analysis_state)| {
             let _ = app.emit(WATCHER_STATE_EVENT, state);
+            let _ = app.emit(analysis::ANALYSIS_STATE_EVENT, analysis_state);
         },
     );
 
@@ -1032,6 +1170,7 @@ mod tests {
             generation: 0,
             state: WatcherState::default(),
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1081,6 +1220,7 @@ mod tests {
             generation: 0,
             state: WatcherState::default(),
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1107,6 +1247,7 @@ mod tests {
             generation: 3,
             state: WatcherState::default(),
             baseline: Some(FileSnapshot::default()),
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1134,6 +1275,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1173,6 +1315,7 @@ mod tests {
             generation: 0,
             state: WatcherState::default(),
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1209,6 +1352,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let publication = Arc::new(Mutex::new(()));
@@ -1245,6 +1389,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let stale = FileChangeRecord {
@@ -1272,6 +1417,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_none());
@@ -1290,6 +1436,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         let stale_state = WatcherState {
@@ -1330,6 +1477,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
         assert!(refresh_runtime_diff(&runtime, 1, &project.0, &baseline).is_some());
@@ -1353,6 +1501,7 @@ mod tests {
                 error: None,
             },
             baseline: None,
+            analysis: analysis::AnalysisState::default(),
             watcher: None,
         }));
 

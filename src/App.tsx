@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react';
 
 import {
+  completeChange,
+  getAnalysisState,
+  subscribeToAnalysis,
+} from './lib/analysisClient';
+import {
   chooseProject,
   getWatcherState,
   stopWatching,
@@ -19,6 +24,11 @@ import {
   createInitialWatcherState,
   createWatcherError,
 } from './state/projectWatcher';
+import {
+  createAnalysisError,
+  createInitialAnalysisState,
+} from './state/analysis';
+import type { AnalysisState } from './types/analysis';
 import type { DiffFileRecord, DiffState, FilePreview } from './types/diff';
 import type { WatcherState } from './types/watcher';
 
@@ -93,6 +103,10 @@ export default function App() {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [analysisState, setAnalysisState] = useState<AnalysisState>(
+    createInitialAnalysisState,
+  );
+  const [isCompleting, setIsCompleting] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -113,6 +127,38 @@ export default function App() {
       } catch (error) {
         if (mounted) {
           setState((current) => createWatcherError(current, errorMessage(error)));
+        }
+      }
+    };
+
+    void connect();
+    return () => {
+      mounted = false;
+      removeListener?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    let removeListener: (() => void) | undefined;
+
+    const connect = async () => {
+      try {
+        const nextRemoveListener = await subscribeToAnalysis(
+          (nextState) => mounted && setAnalysisState(nextState),
+        );
+        if (!mounted) {
+          nextRemoveListener();
+          return;
+        }
+        removeListener = nextRemoveListener;
+        const currentState = await getAnalysisState();
+        if (mounted) setAnalysisState(currentState);
+      } catch (error) {
+        if (mounted) {
+          setAnalysisState((current) =>
+            createAnalysisError(current, errorMessage(error)),
+          );
         }
       }
     };
@@ -179,7 +225,10 @@ export default function App() {
     setIsSelecting(true);
     try {
       const selected = await chooseProject();
-      if (selected) setState(selected);
+      if (selected) {
+        setState(selected);
+        setAnalysisState(createInitialAnalysisState());
+      }
     } catch (error) {
       setState((current) => createWatcherError(current, errorMessage(error)));
     } finally {
@@ -190,8 +239,22 @@ export default function App() {
   const clearProject = async () => {
     try {
       setState(await stopWatching());
+      setAnalysisState(createInitialAnalysisState());
     } catch (error) {
       setState((current) => createWatcherError(current, errorMessage(error)));
+    }
+  };
+
+  const finishChange = async () => {
+    setIsCompleting(true);
+    try {
+      await completeChange();
+    } catch (error) {
+      setAnalysisState((current) =>
+        createAnalysisError(current, errorMessage(error)),
+      );
+    } finally {
+      setIsCompleting(false);
     }
   };
 
@@ -240,7 +303,29 @@ export default function App() {
                 Stop watching
               </button>
             )}
+            {state.projectPath && state.diff.files.length > 0 && (
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => void finishChange()}
+                disabled={isCompleting}
+              >
+                {isCompleting ? 'Completing...' : 'Complete change'}
+              </button>
+            )}
           </div>
+          {analysisState.analysis && (
+            <div className="analysis-summary">
+              <span className="section-label">Latest analysis</span>
+              <p>{analysisState.analysis.record.summary}</p>
+              <p className="analysis-meta">
+                Review priority: {analysisState.analysis.record.reviewPriority}
+              </p>
+            </div>
+          )}
+          {analysisState.error && (
+            <p className="error-message">{analysisState.error}</p>
+          )}
         </section>
 
         <section className="panel files-panel" aria-label="Changed files">

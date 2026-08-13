@@ -37,7 +37,11 @@ h2 { margin-bottom: 0; color: #f8fafc; font-size: 1.12rem; }
 .hint { color: #64748b; font-size: 0.78rem; text-align: right; }
 .project-path { margin: 0; padding: 1.15rem 1.4rem 0; overflow-wrap: anywhere; color: #cbd5e1; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.86rem; line-height: 1.5; }
 .error-message { margin: 0.75rem 1.4rem 0; color: #fda4af; font-size: 0.83rem; line-height: 1.45; }
-.project-actions { display: flex; gap: 0.65rem; padding: 1.15rem 1.4rem 1.35rem; }
+.project-actions { display: flex; flex-wrap: wrap; gap: 0.65rem; padding: 1.15rem 1.4rem 1.35rem; }
+.analysis-summary { margin: 0 1.4rem 1.35rem; border: 1px solid #263650; border-radius: 11px; padding: 0.9rem 1rem; background: #0f172a88; }
+.analysis-summary p { margin: 0; color: #e2e8f0; font-size: 0.86rem; line-height: 1.45; }
+.analysis-summary .section-label { display: block; margin-bottom: 0.4rem; }
+.analysis-summary .analysis-meta { margin-top: 0.4rem; color: #a5b4fc; font-size: 0.75rem; }
 
 .change-list { list-style: none; margin: 0; padding: 0; }
 .change-list li { border-bottom: 1px solid #1e2b42; }
