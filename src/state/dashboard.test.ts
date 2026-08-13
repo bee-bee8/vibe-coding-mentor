@@ -5,6 +5,7 @@ import {
   contentStatusLabel,
   derivePreviewView,
   deriveSelectedRecord,
+  findFrozenFilePreview,
   lineTotalLabel,
   resetInvalidSelection,
 } from './dashboard';
@@ -78,5 +79,26 @@ describe('dashboard view state', () => {
       kind: 'error',
       message: 'Selected file is gone',
     });
+  });
+
+  it('selects an exact completed preview without following a later live edit', () => {
+    const completed: FilePreview = {
+      path: 'src/app.ts',
+      status: 'modified',
+      contentStatus: 'text',
+      before: 'before\n',
+      after: 'completed\n',
+    };
+    const later: FilePreview = {
+      ...completed,
+      before: 'completed\n',
+      after: 'later\n',
+    };
+
+    // The live list may now contain a same-path edit, but the completed
+    // analysis still resolves against its own frozen list.
+    expect(findFrozenFilePreview([completed], 'src/app.ts')).toEqual(completed);
+    expect(findFrozenFilePreview([completed], 'src/app.ts')).not.toEqual(later);
+    expect(findFrozenFilePreview([completed], 'src/other.ts')).toBeNull();
   });
 });

@@ -69,9 +69,13 @@ pub struct AnalysisContext {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ChangeAnalysis {
     pub record: ChangeRecord,
     pub metadata: AnalysisMetadata,
+    /// The completed change's own before/after records.  These remain frozen
+    /// after the watcher rotates to a new live baseline.
+    pub frozen_files: Vec<ScopedFileContext>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -284,6 +288,7 @@ pub fn build_analysis(
             changed_file_count: context.files.len(),
             supplied,
         },
+        frozen_files: context.files,
     }))
 }
 
@@ -435,5 +440,45 @@ mod tests {
         .unwrap();
         assert_ne!(first, second);
         assert_eq!(second.record.changed_components, vec!["app.ts"]);
+    }
+
+    #[test]
+    fn completed_analysis_keeps_frozen_preview_when_the_same_path_changes_again() {
+        let before = snapshot(&[(
+            "app.ts",
+            SnapshotEntry::Content(b"before\n".to_vec()),
+        )]);
+        let completed = snapshot(&[(
+            "app.ts",
+            SnapshotEntry::Content(b"completed\n".to_vec()),
+        )]);
+        let later = snapshot(&[(
+            "app.ts",
+            SnapshotEntry::Content(b"later\n".to_vec()),
+        )]);
+
+        let first = build_analysis(
+            Path::new("C:/project"),
+            &before,
+            &completed,
+            CompletionMetadata::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let second = build_analysis(
+            Path::new("C:/project"),
+            &completed,
+            &later,
+            CompletionMetadata::default(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let first_file = &first.frozen_files[0];
+        assert_eq!(first_file.path, "app.ts");
+        assert_eq!(first_file.before.as_deref(), Some("before\n"));
+        assert_eq!(first_file.after.as_deref(), Some("completed\n"));
+        assert_eq!(second.frozen_files[0].after.as_deref(), Some("later\n"));
+        assert_ne!(first.frozen_files, second.frozen_files);
     }
 }

@@ -16,6 +16,7 @@ import {
   contentStatusLabel,
   derivePreviewView,
   deriveSelectedRecord,
+  findFrozenFilePreview,
   lineTotalLabel,
   resetInvalidSelection,
   type FileSelection,
@@ -28,7 +29,7 @@ import {
   createAnalysisError,
   createInitialAnalysisState,
 } from './state/analysis';
-import type { AnalysisState } from './types/analysis';
+import type { AnalysisState, ChangeAnalysis } from './types/analysis';
 import type { DiffFileRecord, DiffState, FilePreview } from './types/diff';
 import type { WatcherState } from './types/watcher';
 
@@ -94,6 +95,150 @@ function PreviewContent({ view }: { view: ReturnType<typeof derivePreviewView> }
       );
   }
   return null;
+}
+
+type EngineerExplanationProps = {
+  analysis: ChangeAnalysis;
+  projectPath: string | null;
+  setSelection: (selection: FileSelection) => void;
+};
+
+function EngineerText({ value }: { value: string }) {
+  return (
+    <p>
+      {value.trim() ? value : <span className="engineer-empty">Not supplied</span>}
+    </p>
+  );
+}
+
+function EngineerList({ items }: { items: readonly string[] | null | undefined }) {
+  if (!items || items.length === 0) {
+    return <p className="engineer-empty">Not supplied</p>;
+  }
+
+  return (
+    <ul className="engineer-list">
+      {items.map((item, index) => (
+        <li key={`${index}-${item}`}>
+          {item || <span className="engineer-empty">(empty)</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function EngineerExplanation({
+  analysis,
+  projectPath,
+  setSelection,
+}: EngineerExplanationProps) {
+  const activeProjectPath = projectPath;
+  const { record } = analysis;
+  const suppliedTests = analysis.metadata?.supplied?.tests;
+
+  return (
+    <section className="panel engineer-panel" aria-label="Engineer explanation">
+      <div className="panel-heading engineer-panel-heading">
+        <div>
+          <span className="section-label">Current explanation</span>
+          <h2>Engineer</h2>
+        </div>
+        <div className="engineer-mode-strip" aria-label="Explanation modes">
+          <span className="engineer-mode engineer-mode-active">Engineer</span>
+          <span className="engineer-mode engineer-mode-inert">Beginner (future)</span>
+          <span className="engineer-mode engineer-mode-inert">Intermediate (future)</span>
+        </div>
+      </div>
+
+      <div className="engineer-content">
+        <div className="engineer-priority">
+          <span className="engineer-priority-label">Review priority</span>
+          <strong className="engineer-priority-value">
+            {record.reviewPriority.trim() ? record.reviewPriority : 'Not supplied'}
+          </strong>
+        </div>
+
+        <div className="engineer-fields">
+          <article className="engineer-field engineer-field-wide">
+            <h3>Summary</h3>
+            <EngineerText value={record.summary} />
+          </article>
+          <article className="engineer-field">
+            <h3>Purpose</h3>
+            <EngineerText value={record.purpose} />
+          </article>
+          <article className="engineer-field">
+            <h3>How it works / architecture &amp; data flow</h3>
+            <EngineerText value={record.howItWorks} />
+          </article>
+          <article className="engineer-field">
+            <h3>Changed components / important files</h3>
+            <EngineerList items={record.changedComponents} />
+          </article>
+          <article className="engineer-field">
+            <h3>Key decisions</h3>
+            <EngineerList items={record.keyDecisions} />
+          </article>
+          <article className="engineer-field">
+            <h3>Impact</h3>
+            <EngineerText value={record.impact} />
+          </article>
+          <article className="engineer-field">
+            <h3>Risk</h3>
+            <EngineerText value={record.risk} />
+          </article>
+          <article className="engineer-field">
+            <h3>Programming concepts</h3>
+            <EngineerList items={record.programmingConcepts} />
+          </article>
+          <article className="engineer-field">
+            <h3>Tests</h3>
+            <EngineerList items={suppliedTests} />
+          </article>
+        </div>
+
+        <div className="engineer-field engineer-code-locations">
+          <h3>Relevant code locations</h3>
+          {record.relevantCodeLocations.length === 0 ? (
+            <p className="engineer-empty">Not supplied</p>
+          ) : (
+            <ul className="engineer-code-reference-list">
+              {record.relevantCodeLocations.map((location, index) => {
+                const frozenPreview = findFrozenFilePreview(analysis.frozenFiles, location);
+                const isSelectable = activeProjectPath !== null && frozenPreview !== null;
+                return (
+                  <li key={`${index}-${location}`}>
+                    {isSelectable ? (
+                      <button
+                        type="button"
+                        className="engineer-code-reference"
+                        onClick={() => {
+                          if (activeProjectPath !== null) {
+                            setSelection({
+                              projectPath: activeProjectPath,
+                              path: location,
+                              source: 'completed',
+                            });
+                          }
+                        }}
+                      >
+                        <code>{location}</code>
+                        <span>View frozen before / after</span>
+                      </button>
+                    ) : (
+                      <span className="engineer-code-reference engineer-code-reference-static">
+                        <code>{location}</code>
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </section>
+  );
 }
 
 export default function App() {
@@ -170,16 +315,26 @@ export default function App() {
     };
   }, []);
 
-  const selectedRecord = deriveSelectedRecord(
-    state.diff.files,
-    state.projectPath,
-    selection,
-  );
-  const nextSelection = resetInvalidSelection(
-    state.diff.files,
-    state.projectPath,
-    selection,
-  );
+  const selectedLiveRecord =
+    selection?.source === 'completed'
+      ? null
+      : deriveSelectedRecord(state.diff.files, state.projectPath, selection);
+  const selectedFrozenPreview =
+    selection?.source === 'completed' &&
+    state.projectPath !== null &&
+    selection.projectPath === state.projectPath
+      ? findFrozenFilePreview(
+          analysisState.analysis?.frozenFiles ?? [],
+          selection.path,
+        )
+      : null;
+  const selectedRecord = selectedLiveRecord ?? selectedFrozenPreview;
+  const nextSelection =
+    selection?.source === 'completed'
+      ? selectedFrozenPreview
+        ? selection
+        : null
+      : resetInvalidSelection(state.diff.files, state.projectPath, selection);
   if (nextSelection !== selection) {
     setSelection(nextSelection);
   }
@@ -187,8 +342,8 @@ export default function App() {
   const selectedPath = selectedRecord?.path ?? null;
   useEffect(() => {
     let active = true;
-    if (!state.projectPath || !selectedPath) {
-      setPreview(null);
+    if (!state.projectPath || !selectedPath || selectedFrozenPreview) {
+      setPreview(selectedFrozenPreview);
       setPreviewError(null);
       setIsPreviewLoading(false);
       return () => {
@@ -213,10 +368,10 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [selectedPath, state.diff.files, state.projectPath]);
+  }, [selectedFrozenPreview, selectedPath, state.diff.files, state.projectPath]);
 
   const previewView = derivePreviewView(
-    selectedRecord && preview?.path === selectedPath ? preview : null,
+    selectedRecord && (selectedFrozenPreview ?? (preview?.path === selectedPath ? preview : null)),
     selectedRecord ? isPreviewLoading : false,
     selectedRecord ? previewError : null,
   );
@@ -314,19 +469,18 @@ export default function App() {
               </button>
             )}
           </div>
-          {analysisState.analysis && (
-            <div className="analysis-summary">
-              <span className="section-label">Latest analysis</span>
-              <p>{analysisState.analysis.record.summary}</p>
-              <p className="analysis-meta">
-                Review priority: {analysisState.analysis.record.reviewPriority}
-              </p>
-            </div>
-          )}
           {analysisState.error && (
             <p className="error-message">{analysisState.error}</p>
           )}
         </section>
+
+        {analysisState.analysis && (
+          <EngineerExplanation
+            analysis={analysisState.analysis}
+            projectPath={state.projectPath}
+            setSelection={setSelection}
+          />
+        )}
 
         <section className="panel files-panel" aria-label="Changed files">
           <div className="panel-heading">
@@ -425,9 +579,9 @@ export default function App() {
               </span>
             )}
           </div>
-          {selectedRecord && (
+          {selectedLiveRecord && (
             <p className="preview-stats">
-              {fileMetaLabel(selectedRecord)}
+              {fileMetaLabel(selectedLiveRecord)}
             </p>
           )}
           <PreviewContent view={previewView} />

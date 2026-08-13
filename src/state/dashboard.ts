@@ -7,6 +7,15 @@ import type {
 export interface FileSelection {
   projectPath: string;
   path: string;
+  source?: 'live' | 'completed';
+}
+
+/** Find the exact file record retained by a completed Change Analysis. */
+export function findFrozenFilePreview(
+  previews: readonly FilePreview[],
+  path: string,
+): FilePreview | null {
+  return previews.find((preview) => preview.path === path) ?? null;
 }
 
 export function deriveSelectedRecord(

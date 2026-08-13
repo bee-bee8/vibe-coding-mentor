@@ -34,6 +34,15 @@ const analysis: ChangeAnalysis = {
       tests: null,
     },
   },
+  frozenFiles: [
+    {
+      path: 'src/app.ts',
+      status: 'modified',
+      contentStatus: 'text',
+      before: 'old\n',
+      after: 'new\n',
+    },
+  ],
 };
 
 describe('analysis state', () => {

@@ -1,3 +1,5 @@
+import type { FilePreview } from './diff';
+
 export type AnalysisStatus = 'idle' | 'available' | 'error';
 
 export interface CompletionMetadata {
@@ -32,6 +34,7 @@ export interface AnalysisMetadata {
 export interface ChangeAnalysis {
   record: ChangeRecord;
   metadata: AnalysisMetadata;
+  frozenFiles: FilePreview[];
 }
 
 export interface AnalysisState {
