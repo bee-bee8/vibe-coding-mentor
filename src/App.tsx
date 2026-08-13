@@ -46,9 +46,22 @@ import {
 } from './lib/mentorClient';
 import type { AnalysisState, ChangeAnalysis } from './types/analysis';
 import type { DiffFileRecord, DiffState, FilePreview } from './types/diff';
+import type { LearningMemoryState, LearningStatus } from './types/learningMemory';
 import type { MentorState } from './types/mentor';
 import type { WatcherState } from './types/watcher';
 import type { TeachingLevel, TeachingState } from './types/teaching';
+import {
+  getLearningMemoryState,
+  getRelevantLearningMemory,
+  subscribeToLearningMemory,
+  updateLearningMemoryStatus,
+} from './lib/learningMemoryClient';
+import {
+  applyLearningMemoryInvokeResult,
+  applyLearningMemoryState,
+  createInitialLearningMemoryState,
+  createLearningMemoryError,
+} from './state/learningMemory';
 import { getTeachingState, resetTeaching, subscribeToTeaching, teachChange } from './lib/teachingClient';
 import {
   applyTeachingInitialInvokeResult,
@@ -71,6 +84,27 @@ function sourceLabel(diff: DiffState): string {
 
 function countLabel(value: number | null, sign: '+' | '-'): string {
   return value === null ? '?' : `${sign}${value}`;
+}
+
+function conceptKey(concept: string): string {
+  return concept.trim().split(/\s+/).join(' ').toLowerCase();
+}
+
+function learningStatusLabel(status: LearningStatus): string {
+  return status[0].toUpperCase() + status.slice(1);
+}
+
+function uniqueConcepts(concepts: readonly string[]): string[] {
+  const labels = new Map<string, string>();
+  concepts.forEach((concept) => {
+    const key = conceptKey(concept);
+    if (key && !labels.has(key)) labels.set(key, concept.trim());
+  });
+  return [...labels.entries()].map(([key, label]) => `${key}|${label}`);
+}
+
+function uniqueConceptKeys(concepts: readonly string[]): string[] {
+  return [...new Set(concepts.map(conceptKey).filter(Boolean))].sort();
 }
 
 function errorMessage(error: unknown): string {
@@ -346,9 +380,21 @@ function AskMentorPanel({
 
 function TeachingPanel({
   state,
+  memoryState,
+  concepts,
+  updatingConcept,
   onTeach,
-}: { state: TeachingState; onTeach: (level: TeachingLevel) => void }) {
+  onStatusChange,
+}: {
+  state: TeachingState;
+  memoryState: LearningMemoryState;
+  concepts: readonly string[];
+  updatingConcept: string | null;
+  onTeach: (level: TeachingLevel) => void;
+  onStatusChange: (concept: string, status: LearningStatus) => void;
+}) {
   const isLoading = state.status === 'loading';
+  const memoryConcepts = uniqueConcepts(concepts);
   return (
     <section className="panel teaching-panel" aria-label="Teaching Mode">
       <div className="panel-heading"><div><span className="section-label">Teaching Mode</span><h2>Explain this change</h2></div><span className="hint">Choose one level per explanation</span></div>
@@ -359,6 +405,56 @@ function TeachingPanel({
         </div>
         {isLoading && <p className="mentor-status">Building the selected explanation from this frozen change...</p>}
         {state.error && <p className="error-message mentor-error">{state.error}</p>}
+        <div className="learning-memory" aria-label="Learning Memory">
+          <div className="learning-memory-heading">
+            <div>
+              <span className="section-label">Learning Memory</span>
+              <strong>Adjust concept status</strong>
+            </div>
+            <span className="hint">Your choice controls depth</span>
+          </div>
+          {memoryState.status === 'idle' && (
+            <p className="learning-memory-message">Loading the current Change Record concepts...</p>
+          )}
+          {memoryState.error && <p className="error-message mentor-error">{memoryState.error}</p>}
+          {memoryConcepts.length === 0 && memoryState.status !== 'idle' && (
+            <p className="learning-memory-message">No programming concepts were supplied in this Change Record.</p>
+          )}
+          {memoryConcepts.length > 0 && memoryState.status !== 'idle' && (
+            <ul className="learning-memory-list">
+              {memoryConcepts.map((entry) => {
+                const [concept, label] = entry.split('|');
+                const record = memoryState.records.find((item) => item.concept === concept);
+                const canEdit = record !== undefined;
+                const selectedStatus = record?.status ?? 'new';
+                return (
+                  <li key={concept} className="learning-memory-row">
+                    <div className="learning-memory-concept">
+                      <strong>{label}</strong>
+                      <span>{record ? `${record.timesEncountered} encounter${record.timesEncountered === 1 ? '' : 's'}` : 'Not encountered yet'}</span>
+                    </div>
+                    <label className="learning-memory-status">
+                      <span className="sr-only">Status for {label}</span>
+                      <select
+                        aria-label={`Status for ${label}`}
+                        value={selectedStatus}
+                        disabled={!canEdit || updatingConcept !== null}
+                        onChange={(event) => onStatusChange(concept, event.target.value as LearningStatus)}
+                      >
+                        <option value="new">{learningStatusLabel('new')}</option>
+                        <option value="learning">{learningStatusLabel('learning')}</option>
+                        <option value="familiar">{learningStatusLabel('familiar')}</option>
+                      </select>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {memoryConcepts.some((entry) => !memoryState.records.some((record) => record.concept === entry.split('|')[0])) && (
+            <p className="learning-memory-note">New concepts are recorded only after a successful explanation.</p>
+          )}
+        </div>
         {state.answer && state.status === 'available' && <article className="teaching-answer"><h3>{state.answer.level} explanation</h3><p>{state.answer.explanation}</p></article>}
       </div>
     </section>
@@ -381,10 +477,17 @@ export default function App() {
   );
   const [mentorQuestion, setMentorQuestion] = useState('');
   const [teachingState, setTeachingState] = useState<TeachingState>(createInitialTeachingState);
+  const [learningMemoryState, setLearningMemoryState] = useState<LearningMemoryState>(
+    createInitialLearningMemoryState,
+  );
+  const [updatingLearningMemoryConcept, setUpdatingLearningMemoryConcept] = useState<string | null>(null);
   const mentorRequestToken = useRef(0);
   const mentorEventVersion = useRef(0);
   const teachingRequestToken = useRef(0);
   const teachingEventVersion = useRef(0);
+  const learningMemoryRequestToken = useRef(0);
+  const learningMemoryEventVersion = useRef(0);
+  const learningMemoryUpdatePendingRef = useRef(false);
 
   useEffect(() => {
     let mounted = true;
@@ -511,6 +614,55 @@ export default function App() {
   useEffect(() => {
     let mounted = true;
     let removeListener: (() => void) | undefined;
+    let eventVersionBeforeInvoke: number | undefined;
+
+    const connect = async () => {
+      try {
+        const nextRemoveListener = await subscribeToLearningMemory((nextState) => {
+          learningMemoryEventVersion.current += 1;
+          if (mounted) {
+            setLearningMemoryState((current) => applyLearningMemoryState(current, nextState));
+          }
+        });
+        if (!mounted) {
+          nextRemoveListener();
+          return;
+        }
+        removeListener = nextRemoveListener;
+        const invokeEventVersion = learningMemoryEventVersion.current;
+        eventVersionBeforeInvoke = invokeEventVersion;
+        const currentState = await getLearningMemoryState();
+        if (mounted) {
+          setLearningMemoryState((current) =>
+            applyLearningMemoryInvokeResult(
+              current,
+              currentState,
+              invokeEventVersion,
+              learningMemoryEventVersion.current,
+            ),
+          );
+        }
+      } catch (error) {
+        if (
+          mounted &&
+          (eventVersionBeforeInvoke === undefined ||
+            eventVersionBeforeInvoke === learningMemoryEventVersion.current)
+        ) {
+          setLearningMemoryState((current) => createLearningMemoryError(current, errorMessage(error)));
+        }
+      }
+    };
+
+    void connect();
+    return () => {
+      mounted = false;
+      removeListener?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    let removeListener: (() => void) | undefined;
 
     const connect = async () => {
       try {
@@ -540,8 +692,15 @@ export default function App() {
     };
   }, []);
 
+  const completionGeneration = analysisState.analysis?.metadata.completionGeneration ?? null;
   const analysisKey = analysisState.analysis
-    ? `${analysisState.analysis.metadata.projectPath}:${analysisState.analysis.metadata.completionGeneration}`
+    ? `${analysisState.analysis.metadata.projectPath}:${completionGeneration}`
+    : null;
+  const learningMemoryConcepts = analysisState.analysis
+    ? uniqueConceptKeys(analysisState.analysis.record.programmingConcepts)
+    : [];
+  const learningMemoryConceptsKey = analysisState.analysis
+    ? JSON.stringify(learningMemoryConcepts)
     : null;
 
   useEffect(() => {
@@ -553,6 +712,46 @@ export default function App() {
     void resetMentor().catch(() => undefined);
     void resetTeaching().catch(() => undefined);
   }, [analysisKey]);
+
+  useEffect(() => {
+    const requestToken = ++learningMemoryRequestToken.current;
+    const concepts = analysisKey === null || learningMemoryConceptsKey === null
+      ? []
+      : (JSON.parse(learningMemoryConceptsKey) as string[]);
+    learningMemoryUpdatePendingRef.current = false;
+    setUpdatingLearningMemoryConcept(null);
+    setLearningMemoryState(
+      createInitialLearningMemoryState(concepts, completionGeneration),
+    );
+    if (
+      analysisKey === null
+      || learningMemoryConceptsKey === null
+      || completionGeneration === null
+    ) return;
+
+    const invokeEventVersion = learningMemoryEventVersion.current;
+    void getRelevantLearningMemory(concepts, completionGeneration)
+      .then((nextState) => {
+        if (requestToken === learningMemoryRequestToken.current) {
+          setLearningMemoryState((current) =>
+            applyLearningMemoryInvokeResult(
+              current,
+              nextState,
+              invokeEventVersion,
+              learningMemoryEventVersion.current,
+            ),
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (
+          requestToken === learningMemoryRequestToken.current &&
+          invokeEventVersion === learningMemoryEventVersion.current
+        ) {
+          setLearningMemoryState((current) => createLearningMemoryError(current, errorMessage(error)));
+        }
+      });
+  }, [analysisKey, learningMemoryConceptsKey, completionGeneration]);
 
   const selectedLiveRecord =
     selection?.source === 'completed'
@@ -708,6 +907,44 @@ export default function App() {
     }
   };
 
+  const changeLearningMemoryStatus = async (concept: string, status: LearningStatus) => {
+    if (completionGeneration === null) return;
+    if (learningMemoryUpdatePendingRef.current) return;
+    learningMemoryUpdatePendingRef.current = true;
+    const requestToken = ++learningMemoryRequestToken.current;
+    const invokeEventVersion = learningMemoryEventVersion.current;
+    setUpdatingLearningMemoryConcept(concept);
+    try {
+      const nextState = await updateLearningMemoryStatus(
+        concept,
+        status,
+        completionGeneration,
+      );
+      if (requestToken === learningMemoryRequestToken.current) {
+        setLearningMemoryState((current) =>
+          applyLearningMemoryInvokeResult(
+            current,
+            nextState,
+            invokeEventVersion,
+            learningMemoryEventVersion.current,
+          ),
+        );
+      }
+    } catch (error) {
+      if (
+        requestToken === learningMemoryRequestToken.current &&
+        invokeEventVersion === learningMemoryEventVersion.current
+      ) {
+        setLearningMemoryState((current) => createLearningMemoryError(current, errorMessage(error)));
+      }
+    } finally {
+      if (requestToken === learningMemoryRequestToken.current) {
+        learningMemoryUpdatePendingRef.current = false;
+        setUpdatingLearningMemoryConcept(null);
+      }
+    }
+  };
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -789,7 +1026,16 @@ export default function App() {
           />
         )}
 
-        {analysisState.analysis && <TeachingPanel state={teachingState} onTeach={(level) => void explainChange(level)} />}
+        {analysisState.analysis && (
+          <TeachingPanel
+            state={teachingState}
+            memoryState={learningMemoryState}
+            concepts={analysisState.analysis.record.programmingConcepts}
+            updatingConcept={updatingLearningMemoryConcept}
+            onTeach={(level) => void explainChange(level)}
+            onStatusChange={(concept, status) => void changeLearningMemoryStatus(concept, status)}
+          />
+        )}
 
         <section className="panel files-panel" aria-label="Changed files">
           <div className="panel-heading">

@@ -20,6 +20,7 @@
 .env.*
 !.env.example
 *.local
+learning-memory.sqlite3
 
 # Logs and tool caches
 *.log
